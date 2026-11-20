@@ -5,7 +5,7 @@ Fastify 5, TypeScript (ESM, NodeNext), Firebase Admin, `pg`, Supabase Storage, Z
 ## Setup
 
 1. `npm install`
-2. Copy `.env.example` to `.env` and fill it in.
+2. Copy `.env.example` to `.env` (development) and fill it in. For production, copy it again to `.env.prod` with the production values (see [Environments](#environments)).
 
 | Variable | Purpose |
 | --- | --- |
@@ -19,13 +19,14 @@ Fastify 5, TypeScript (ESM, NodeNext), Firebase Admin, `pg`, Supabase Storage, Z
 | `SUPER_ADMIN_EMAILS` | Verified emails that become `super_admin` when they register |
 
 3. **PostgreSQL**: run `sql/schema.sql` in the Supabase SQL editor. It creates `daily_metrics`, `monthly_metrics`, `yearly_metrics`, `analytics_events`, `moderation_actions` and `admin_audit_logs`, enables row level security and revokes `anon` and `authenticated` access. Only the server connection uses these tables.
-4. **Firestore**: set the project, deploy the rules and indexes, then verify:
+4. **Firestore**: log in, deploy the rules and indexes, then verify:
    ```
    firebase login
-   firebase use <your-firebase-project-id>   # must equal FIREBASE_PROJECT_ID in .env
-   pnpm deploy:firestore                      # firebase deploy --only firestore:rules,firestore:indexes
-   pnpm check:firestore                       # confirms the project matches and every index is ready
+   pnpm deploy:firestore        # dev:  project from FIREBASE_PROJECT_ID in .env
+   pnpm deploy:firestore:prod   # prod: project from FIREBASE_PROJECT_ID in .env.prod (asks you to type the project id)
+   pnpm check:firestore         # or check:firestore:prod. Confirms the project matches and every index is ready
    ```
+   The deploy project always comes from the env file, never from `.firebaserc`, so it cannot drift from what the server uses.
    `firestore.rules` denies all client access (only the backend, via the Admin SDK, touches Firestore).
    Indexes take a few minutes to build; `check:firestore` shows which are still building.
 5. **Storage**: create the bucket named in `SUPABASE_STORAGE_BUCKET` and make it public for reads (uploads happen only through the API).
@@ -38,14 +39,30 @@ Fastify 5, TypeScript (ESM, NodeNext), Firebase Admin, `pg`, Supabase Storage, Z
 
 | Command | What it does |
 | --- | --- |
-| `npm run dev` | Watch mode with `.env` loaded |
-| `npm run build` / `npm start` | Compile to `dist/` and run it |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm test` | Unit tests (`node:test` through `tsx`) |
-| `npm run seed` | Seed categories and settings |
-| `pnpm make-admin <email> [role]` | Give an existing account a role (default `super_admin`) |
-| `pnpm check:firestore` | Verify deploy project and that all Firestore indexes exist |
-| `pnpm deploy:firestore` | Deploy `firestore.rules` and `firestore.indexes.json` |
+| `pnpm dev` / `pnpm dev:prod` | Watch mode against the dev (`.env`) or prod (`.env.prod`) environment |
+| `pnpm build` | Compile to `dist/` |
+| `pnpm start` / `pnpm start:prod` | Run the compiled build with `.env` or `.env.prod` |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm test` | Unit tests (`node:test` through `tsx`) |
+| `pnpm seed` / `pnpm seed:prod` | Seed categories and settings |
+| `pnpm make-admin <email> [role]` (`make-admin:prod`) | Give an existing account a role (default `super_admin`) |
+| `pnpm check:firestore` (`check:firestore:prod`) | Verify deploy project and that all Firestore indexes exist |
+| `pnpm deploy:firestore` (`deploy:firestore:prod`) | Deploy `firestore.rules` and `firestore.indexes.json` to the env's Firebase project |
+
+## Environments
+
+| File | Used by | Purpose |
+| --- | --- | --- |
+| `.env` | `dev`, `start`, `seed`, `make-admin`, `check:firestore`, `deploy:firestore` | Development |
+| `.env.prod` | the same scripts with a `:prod` suffix | Production |
+
+Both files have the same variables (see `.env.example`). Everything except `.env.example` is git ignored.
+Set `NODE_ENV=production` in `.env.prod` if you deploy that file. Locally it only turns on `trustProxy`.
+
+**`pnpm dev:prod` runs your local code against the real production Firestore, PostgreSQL and storage.**
+Writes are real. On boot the server logs the `firebaseProject` it is using, so check that line before you click around.
+The deploy script is separate: `pnpm deploy:firestore:prod` shows the target project and asks you to type its id.
+Pass `--yes` (`tsx scripts/deploy-firestore.ts prod --yes`) to skip that prompt in CI.
 
 ## Layout
 

@@ -4,7 +4,7 @@ import { getAuth, optionalUser, requireUser } from "../../middleware/authenticat
 import { ok, okPage } from "../../utils/respond.js";
 import { idParam, parse } from "../../utils/validation.js";
 import { clampLimit } from "../../utils/pagination.js";
-import { badRequest } from "../../utils/errors.js";
+import { badRequest, forbidden } from "../../utils/errors.js";
 import { viewerKey } from "../../utils/request.js";
 import { uploadPublic, ALLOWED_IMAGE_TYPES, sniffImageType } from "../../services/storage.service.js";
 import { workRef } from "../../repositories/works.repo.js";
@@ -25,11 +25,22 @@ import {
 
 const idParams = z.object({ id: idParam });
 
+/** How many works a signed out visitor can see in discovery. */
+export const GUEST_FEED_LIMIT = 20;
+
 export async function workRoutes(app: FastifyInstance) {
   // Discovery. Only published + public works are ever returned.
+  // Signed out visitors only ever get the first GUEST_FEED_LIMIT works. There is no cursor to follow,
+  // and `gated` tells the client there is more behind signing in.
   app.get("/", { preHandler: optionalUser }, async (req) => {
-    const page = await listPublicWorks(parse(listQuerySchema, req.query), req.auth);
-    return okPage(page.items, page.nextCursor);
+    const q = parse(listQuerySchema, req.query);
+    if (req.auth) {
+      const page = await listPublicWorks(q, req.auth);
+      return okPage(page.items, page.nextCursor);
+    }
+    if (q.cursor) throw forbidden("LOGIN_REQUIRED", "Log in or create your account to view more.");
+    const page = await listPublicWorks({ ...q, limit: String(GUEST_FEED_LIMIT) }, null);
+    return okPage(page.items, null, { gated: page.nextCursor !== null });
   });
 
   app.get("/mine", { preHandler: requireUser }, async (req) => {

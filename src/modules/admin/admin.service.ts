@@ -9,6 +9,7 @@ import { getUserById, usersCol, toPublicProfile } from "../../repositories/users
 import { getCategory } from "../../repositories/categories.repo.js";
 import { getWork, workRef, worksCol, hydrateWorks } from "../../repositories/works.repo.js";
 import { logAdmin, type AdminAction } from "../../services/audit.service.js";
+import { notify } from "../../services/notifications.service.js";
 import { invalidateProfile } from "../../services/profile-cache.service.js";
 import { deletePrefix } from "../../services/storage.service.js";
 import { AppError, badRequest, conflict, notFound, unavailable } from "../../utils/errors.js";
@@ -41,6 +42,7 @@ export function toAdminUserDto(u: UserDoc) {
     permissionOverrides: u.permissions ?? {},
     accountStatus: u.accountStatus,
     statusReason: u.statusReason ?? null,
+    verifiedAt: u.verifiedAt ?? null,
     updatedAt: u.updatedAt,
   });
 }
@@ -76,19 +78,38 @@ export async function searchUsers(params: { q?: string; role?: string; status?: 
   return { items: docs.map((d) => toAdminUserDto({ id: d.id, ...d.data() } as UserDoc)), nextCursor };
 }
 
-export async function getUserDetail(uid: string) {
+/**
+ * The Postgres history is supplementary. If the database cannot be reached (a DNS or network blip),
+ * the account still opens with empty history and `historyAvailable: false`, so admin actions such as
+ * verification keep working instead of the whole panel failing with a 500.
+ */
+export async function getUserDetail(uid: string, log?: Logger) {
   const user = await loadTarget(uid);
+  let historyAvailable = true;
+  const safe = async (run: () => Promise<{ rows: unknown[] }>) => {
+    try {
+      return await run();
+    } catch (err) {
+      historyAvailable = false;
+      log?.error({ uid, err: (err as Error).message }, "USER_HISTORY_UNAVAILABLE");
+      return { rows: [] as unknown[] };
+    }
+  };
   const [perms, history, activity] = await Promise.all([
     usersCol().doc(uid).collection("categoryPermissions").limit(200).get(),
-    query(
-      `SELECT id, work_id, action, reason, moderator_id, created_at FROM moderation_actions
+    safe(() =>
+      query(
+        `SELECT id, work_id, action, reason, moderator_id, created_at FROM moderation_actions
         WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`,
-      [uid],
+        [uid],
+      ),
     ),
-    query(
-      `SELECT id, admin_id, action, target_type, metadata, created_at FROM admin_audit_logs
+    safe(() =>
+      query(
+        `SELECT id, admin_id, action, target_type, metadata, created_at FROM admin_audit_logs
         WHERE target_id = $1 OR admin_id = $1 ORDER BY created_at DESC LIMIT 20`,
-      [uid],
+        [uid],
+      ),
     ),
   ]);
   return {
@@ -96,6 +117,7 @@ export async function getUserDetail(uid: string) {
     categoryPermissions: perms.docs.map((d) => ({ categoryId: d.id, canPost: d.get("canPost") === true })),
     moderationHistory: history.rows,
     adminActivity: activity.rows,
+    historyAvailable,
   };
 }
 
@@ -173,6 +195,34 @@ export async function setCategoryPermission(actor: AuthContext, uid: string, cat
   );
   await logAdmin({ adminId: actor.uid, action: "USER_CATEGORY_PERMISSION_CHANGED", targetType: "user", targetId: uid, metadata: { categoryId, canPost } }, log);
   return { categoryId, canPost };
+}
+
+/**
+ * Confers or removes the verification badge. Super admin only (enforced by the route guard and
+ * re-checked here). Idempotent: repeating the same change is a no-op and writes no audit row.
+ * Unlike disabling or role changes this is not a rank action, so a super admin may be verified too.
+ */
+export async function setVerification(actor: AuthContext, uid: string, verified: boolean, log: Logger) {
+  if (actor.profile.role !== "super_admin") {
+    throw new AppError("SUPER_ADMIN_ONLY", "Only a super admin can do this.", 403);
+  }
+  const target = await loadTarget(uid);
+  if ((target.verified === true) === verified) return toAdminUserDto(target);
+
+  await usersCol().doc(uid).update(
+    verified
+      ? { verified: true, verifiedAt: FieldValue.serverTimestamp(), verifiedBy: actor.uid, updatedAt: FieldValue.serverTimestamp() }
+      : { verified: false, verifiedAt: null, verifiedBy: null, updatedAt: FieldValue.serverTimestamp() },
+  );
+  invalidateProfile(uid);
+  await logAdmin(
+    { adminId: actor.uid, action: verified ? "USER_VERIFIED" : "USER_UNVERIFIED", targetType: "user", targetId: uid, metadata: { username: target.username } },
+    log,
+  );
+  if (verified) {
+    await notify(uid, { type: "BADGE_CONFERRED", title: "You have been verified", body: "Inkspire has conferred a verification badge on your profile." }, log);
+  }
+  return toAdminUserDto((await getUserById(uid))!);
 }
 
 /**

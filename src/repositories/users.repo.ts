@@ -32,8 +32,13 @@ export async function getUsersByIds(ids: string[]): Promise<Map<string, UserDoc>
 
 /** Fields safe to show to anyone. */
 export function toAuthorSummary(u: UserDoc | undefined | null) {
-  if (!u) return { username: "unknown", displayName: "Unknown author", profilePhotoUrl: null };
-  return { username: u.username, displayName: u.displayName, profilePhotoUrl: u.profilePhotoUrl ?? null };
+  if (!u) return { username: "unknown", displayName: "Unknown author", profilePhotoUrl: null, verified: false };
+  return {
+    username: u.username,
+    displayName: u.displayName,
+    profilePhotoUrl: u.profilePhotoUrl ?? null,
+    verified: u.verified === true,
+  };
 }
 
 export function toPublicProfile(u: UserDoc) {
@@ -44,6 +49,7 @@ export function toPublicProfile(u: UserDoc) {
     profilePhotoUrl: u.profilePhotoUrl ?? null,
     coverPhotoUrl: u.coverPhotoUrl ?? null,
     avatarType: u.avatarType,
+    verified: u.verified === true,
     createdAt: u.createdAt,
     stats: {
       publishedWorks: Math.max(0, u.publishedWorkCount ?? 0),

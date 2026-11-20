@@ -9,14 +9,20 @@
   },
   "scripts": {
     "dev": "tsx watch --env-file=.env src/server.ts",
+    "dev:prod": "tsx watch --env-file=.env.prod src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node --env-file=.env dist/server.js",
+    "start:prod": "node --env-file=.env.prod dist/server.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
     "seed": "tsx --env-file=.env scripts/seed.ts",
+    "seed:prod": "tsx --env-file=.env.prod scripts/seed.ts",
     "make-admin": "tsx --env-file=.env scripts/make-admin.ts",
+    "make-admin:prod": "tsx --env-file=.env.prod scripts/make-admin.ts",
     "check:firestore": "tsx --env-file=.env scripts/check-firestore.ts",
-    "deploy:firestore": "firebase deploy --only firestore:rules,firestore:indexes"
+    "check:firestore:prod": "tsx --env-file=.env.prod scripts/check-firestore.ts",
+    "deploy:firestore": "tsx scripts/deploy-firestore.ts dev",
+    "deploy:firestore:prod": "tsx scripts/deploy-firestore.ts prod"
   },
   "dependencies": {
     "@dicebear/collection": "^9.2.0",

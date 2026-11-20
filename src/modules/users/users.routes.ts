@@ -2,12 +2,15 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getAuth, optionalUser, requireUser } from "../../middleware/authenticate.js";
 import { getUserByUsername, getUserById, toPrivateProfile, toPublicProfile } from "../../repositories/users.repo.js";
-import { notFound, badRequest } from "../../utils/errors.js";
+import { notFound, badRequest, forbidden } from "../../utils/errors.js";
 import { parse } from "../../utils/validation.js";
 import { ok, okPage } from "../../utils/respond.js";
 import { clampLimit } from "../../utils/pagination.js";
 import { listAuthorPublicWorks } from "../works/works.service.js";
 import { removePhoto, savePhoto, updateProfileSchema, updateProfile, type PhotoKind } from "./users.service.js";
+
+/** How many of an author's works a signed out visitor can see. */
+export const GUEST_AUTHOR_WORKS_LIMIT = 12;
 
 const kindQuery = z.object({ kind: z.enum(["profile", "cover"]) });
 
@@ -27,6 +30,12 @@ export async function userRoutes(app: FastifyInstance) {
     const q = parse(z.object({ cursor: z.string().optional(), limit: z.string().optional() }), req.query);
     const user = await getUserByUsername(username);
     if (!user || user.accountStatus === "blocked") throw notFound("USER_NOT_FOUND", "That profile does not exist.");
+    if (!req.auth) {
+      // Signed out: one page only, no cursor to follow. `gated` tells the client there is more.
+      if (q.cursor) throw forbidden("LOGIN_REQUIRED", "Log in or create your account to view more.");
+      const first = await listAuthorPublicWorks(user.id, { limit: GUEST_AUTHOR_WORKS_LIMIT }, null);
+      return okPage(first.items, null, { gated: first.nextCursor !== null });
+    }
     const page = await listAuthorPublicWorks(user.id, { cursor: q.cursor, limit: clampLimit(q.limit, 12, 30) }, req.auth);
     return okPage(page.items, page.nextCursor);
   });

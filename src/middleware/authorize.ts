@@ -15,6 +15,14 @@ export function requirePermission(...keys: PermissionKey[]) {
   };
 }
 
+/** Route guard: only a super admin may continue. Used for actions that are not delegable, such as verification badges. */
+export async function requireSuperAdmin(req: FastifyRequest): Promise<void> {
+  if (!req.auth) throw unauthorized();
+  if (req.auth.profile.role !== "super_admin") {
+    throw forbidden("SUPER_ADMIN_ONLY", "Only a super admin can do this.");
+  }
+}
+
 type FeatureFlag = "allowComments" | "allowLikes" | "allowSharing";
 
 const FEATURE_MESSAGES: Record<FeatureFlag, string> = {

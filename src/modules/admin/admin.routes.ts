@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getAuth, requireUser } from "../../middleware/authenticate.js";
-import { requirePermission } from "../../middleware/authorize.js";
+import { requirePermission, requireSuperAdmin } from "../../middleware/authorize.js";
 import { clampLimit } from "../../utils/pagination.js";
 import { ok, okPage } from "../../utils/respond.js";
 import { idParam, parse } from "../../utils/validation.js";
@@ -21,6 +21,7 @@ import {
   roleSchema,
   searchUsers,
   setCategoryPermission,
+  setVerification,
   statusSchema,
   triggerPasswordReset,
 } from "./admin.service.js";
@@ -48,7 +49,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.get("/users/:uid", { preHandler: users }, async (req) => {
     const { uid: id } = parse(uid, req.params);
-    return ok(await getUserDetail(id));
+    return ok(await getUserDetail(id, req.log));
   });
 
   app.post("/users/:uid/disable", { preHandler: users }, async (req) => {
@@ -81,6 +82,19 @@ export async function adminRoutes(app: FastifyInstance) {
   app.put("/users/:uid/permissions", { preHandler: [requireUser, requirePermission("manageRoles")] }, async (req) => {
     const { uid: id } = parse(uid, req.params);
     return ok({ user: await changePermissions(getAuth(req), id, parse(permissionsSchema, req.body).permissions, req.log) });
+  });
+
+  // Verification badge: super admins only, and nothing else grants it.
+  const superAdmin = [requireUser, requireSuperAdmin];
+
+  app.put("/users/:uid/verification", { preHandler: superAdmin }, async (req) => {
+    const { uid: id } = parse(uid, req.params);
+    return ok({ user: await setVerification(getAuth(req), id, true, req.log) });
+  });
+
+  app.delete("/users/:uid/verification", { preHandler: superAdmin }, async (req) => {
+    const { uid: id } = parse(uid, req.params);
+    return ok({ user: await setVerification(getAuth(req), id, false, req.log) });
   });
 
   app.put("/users/:uid/category-permissions/:categoryId", { preHandler: users }, async (req) => {

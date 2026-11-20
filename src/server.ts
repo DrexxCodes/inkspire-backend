@@ -22,6 +22,11 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
 
 try {
+  // Makes it obvious which environment a local server is pointed at. Never log secrets here.
+  app.log.info(
+    { nodeEnv: env.NODE_ENV, firebaseProject: env.FIREBASE_PROJECT_ID, supabaseUrl: env.SUPABASE_URL },
+    "environment",
+  );
   await app.listen({ port: env.PORT, host: env.HOST });
 } catch (err) {
   app.log.error({ err }, "failed to start");

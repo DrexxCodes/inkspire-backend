@@ -8,7 +8,8 @@ export type NotificationType =
   | "WORK_REJECTED"
   | "REVIEW_RECEIVED"
   | "NEW_COMMENT"
-  | "NEW_LIKE";
+  | "NEW_LIKE"
+  | "BADGE_CONFERRED";
 
 /** Writes a user facing notification. Failures never block the triggering action. */
 export async function notify(

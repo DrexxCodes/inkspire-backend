@@ -22,6 +22,10 @@ export interface UserDoc extends Doc {
   accountStatus: AccountStatus;
   publishedWorkCount?: number;
   likesReceived?: number;
+  /** Verification badge conferred by a super admin. Missing means not verified. */
+  verified?: boolean;
+  verifiedAt?: FirebaseFirestore.Timestamp | null;
+  verifiedBy?: string | null;
 }
 
 export interface AuthContext {
