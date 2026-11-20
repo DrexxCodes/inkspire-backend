@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// Inkspire's browser app only uses Firebase Authentication. Every read and write of
+// Firestore goes through the Fastify backend, which uses the Admin SDK (and the Admin SDK
+// bypasses these rules). So clients get no direct access at all.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
