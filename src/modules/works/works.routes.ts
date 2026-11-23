@@ -7,18 +7,18 @@ import { clampLimit } from "../../utils/pagination.js";
 import { badRequest, forbidden } from "../../utils/errors.js";
 import { viewerKey } from "../../utils/request.js";
 import { uploadPublic, ALLOWED_IMAGE_TYPES, sniffImageType } from "../../services/storage.service.js";
-import { workRef } from "../../repositories/works.repo.js";
-import { FieldValue } from "firebase-admin/firestore";
 import { chunkQuerySchema, createWorkSchema, listQuerySchema } from "./works.schemas.js";
 import { loadOwnWork, loadVisibleWork } from "./works.guards.js";
 import {
   archiveWork,
   createWork,
+  detachFromPrompt,
   getWorkDto,
   listMyWorks,
   listPublicWorks,
   publishWork,
   readWorkContent,
+  setCoverImage,
   setVisibility,
   softDeleteWork,
 } from "./works.service.js";
@@ -97,6 +97,12 @@ export async function workRoutes(app: FastifyInstance) {
     return ok({ work: await setVisibility(getAuth(req), id, visibility) });
   });
 
+  // Withdraw a work from the prompt it was written for (never allowed for a winner).
+  app.delete("/:id/prompt", { preHandler: requireUser, config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (req) => {
+    const { id } = parse(idParams, req.params);
+    return ok({ work: await detachFromPrompt(getAuth(req), id) });
+  });
+
   app.delete("/:id", { preHandler: requireUser }, async (req) => {
     const { id } = parse(idParams, req.params);
     await softDeleteWork(getAuth(req), id, req.log);
@@ -114,7 +120,7 @@ export async function workRoutes(app: FastifyInstance) {
     const type = sniffImageType(buffer);
     if (!type || !ALLOWED_IMAGE_TYPES[type]) throw badRequest("UNSUPPORTED_IMAGE", "Please upload a JPEG, PNG or WebP image.");
     const url = await uploadPublic(`works/${id}/cover.${ALLOWED_IMAGE_TYPES[type]}`, buffer, type);
-    await workRef(id).update({ coverImageUrl: url, updatedAt: FieldValue.serverTimestamp() });
+    await setCoverImage(id, url);
     return ok({ url });
   });
 }

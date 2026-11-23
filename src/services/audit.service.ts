@@ -31,6 +31,12 @@ export type AdminAction =
   | "WORK_DELETED"
   | "WORK_RESTORED"
   | "WORK_PERMANENTLY_DELETED"
+  | "PROMPT_CREATED"
+  | "PROMPT_UPDATED"
+  | "PROMPT_PUBLISHED"
+  | "PROMPT_UNPUBLISHED"
+  | "PROMPT_DELETED"
+  | "PROMPT_WINNERS_ANNOUNCED"
   | "PLATFORM_SETTING_CHANGED";
 
 export interface ModerationEntry {
@@ -46,7 +52,7 @@ export interface ModerationEntry {
 export interface AdminEntry {
   adminId: string;
   action: AdminAction;
-  targetType: "user" | "work" | "category" | "settings";
+  targetType: "user" | "work" | "category" | "settings" | "prompt";
   targetId: string;
   metadata?: Record<string, unknown>;
 }

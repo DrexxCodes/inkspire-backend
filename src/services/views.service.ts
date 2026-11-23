@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { FieldValue } from "firebase-admin/firestore";
-import { db } from "../config/firebase.js";
+import { pool } from "../config/postgres.js";
 import { track } from "./analytics.service.js";
 
 type Logger = { error: (o: object, m: string) => void; info: (o: object, m: string) => void };
@@ -11,7 +10,7 @@ const MAX_TRACKED_VIEWERS = 200_000;
 
 /**
  * Views are buffered in memory and flushed in aggregate, so a page visit never costs one
- * Firestore write. Repeat views by the same viewer inside the window are ignored.
+ * database write. Repeat views by the same viewer inside the window are ignored.
  *
  * Trade off: a crash can lose up to FLUSH_INTERVAL_MS of view counts. The graceful shutdown
  * hook flushes first. For multi instance deployments move this buffer to Redis or a queue.
@@ -56,14 +55,17 @@ export class ViewAggregator {
     this.pending = new Map();
     const flushId = randomUUID();
     let total = 0;
-    for (const [workId, count] of snapshot) {
-      total += count;
-      try {
-        await db.collection("works").doc(workId).update({ viewCount: FieldValue.increment(count) });
-      } catch (err) {
-        // Work was removed since the view was recorded, or Firestore hiccuped. Do not retry forever.
-        this.log.error({ workId, count, err: (err as Error).message }, "VIEW_FLUSH_FAILED");
-      }
+    for (const count of snapshot.values()) total += count;
+    try {
+      // One statement for the whole batch. Works removed since the view was recorded simply match no row.
+      await pool.query(
+        `UPDATE works w SET view_count = w.view_count + v.n
+           FROM unnest($1::text[], $2::int[]) AS v(id, n) WHERE w.id = v.id`,
+        [[...snapshot.keys()], [...snapshot.values()]],
+      );
+    } catch (err) {
+      // Do not retry forever. A lost flush costs a few view counts, never a request.
+      this.log.error({ works: snapshot.size, total, err: (err as Error).message }, "VIEW_FLUSH_FAILED");
     }
     track({ eventId: `views:${flushId}`, metric: "views", delta: total }, this.log);
   }

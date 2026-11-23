@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { idParam } from "../../utils/validation.js";
 
 export const title = z.string().trim().min(1, "Give your work a title.").max(200);
 export const description = z.string().trim().max(1000);
@@ -12,6 +13,8 @@ export const createWorkSchema = z.object({
   visibility: z.enum(["public", "private"]).default("public"),
   content: z.string().min(1, "A work needs some content."),
   publish: z.boolean().default(false),
+  /** Write this work for a prompt. Must be open, and the category must be the prompt's own. */
+  promptId: idParam.optional(),
   /** Client generated. A retried request with the same key returns the same work. */
   idempotencyKey: z.string().min(8).max(100).optional(),
 });
@@ -45,6 +48,8 @@ export const listQuerySchema = z.object({
   category: z.string().max(128).optional(),
   sort: z.enum(["latest", "popular", "viewed", "discussed"]).default("latest"),
   q: z.string().trim().max(100).optional(),
+  /** Only the entries of one prompt. */
+  prompt: idParam.optional(),
 });
 
 export const chunkQuerySchema = z.object({

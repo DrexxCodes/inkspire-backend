@@ -1,10 +1,11 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
-import { db } from "../../config/firebase.js";
 import { categoriesCol, getCategory, invalidateCategoryCache } from "../../repositories/categories.repo.js";
 import { conflict, notFound } from "../../utils/errors.js";
 import { slugify } from "../../utils/text.js";
 import { logAdmin } from "../../services/audit.service.js";
+import { categoryHasWorks } from "../../repositories/work-stats.repo.js";
+import { promptsUseCategory } from "../../repositories/prompts.repo.js";
 
 type Logger = Parameters<typeof logAdmin>[1];
 
@@ -51,7 +52,6 @@ export async function createCategory(adminId: string, input: z.output<typeof cre
     description: input.description,
     imageUrl: input.imageUrl ?? null,
     isActive: input.isActive,
-    publishedCount: 0,
     createdBy: adminId,
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
@@ -74,9 +74,11 @@ export async function updateCategory(adminId: string, id: string, patch: z.outpu
 export async function deleteCategory(adminId: string, id: string, log: Logger) {
   const existing = await getCategory(id);
   if (!existing) throw notFound("CATEGORY_NOT_FOUND", "That category does not exist.");
-  const inUse = await db.collection("works").where("categoryId", "==", id).limit(1).get();
-  if (!inUse.empty) {
+  if (await categoryHasWorks(id)) {
     throw conflict("CATEGORY_IN_USE", "This category still has works. Deactivate it instead of deleting it.");
+  }
+  if (await promptsUseCategory(id)) {
+    throw conflict("CATEGORY_IN_USE", "This category still has prompts. Deactivate it instead of deleting it.");
   }
   await categoriesCol().doc(id).delete();
   invalidateCategoryCache();

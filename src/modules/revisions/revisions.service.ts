@@ -1,30 +1,22 @@
-import { FieldValue } from "firebase-admin/firestore";
-import { db } from "../../config/firebase.js";
-import type { AuthContext, Doc } from "../../types/domain.js";
-import {
-  draftChunks,
-  draftStateRef,
-  revisionChunks,
-  revisionRef,
-  revisionsCol,
-  workChunks,
-  workRef,
-} from "../../repositories/works.repo.js";
+import type { PoolClient } from "pg";
+import { pool, withTransaction } from "../../config/postgres.js";
+import type { AuthContext } from "../../types/domain.js";
+import { getRevision as getRevisionRecord, lockWork, mapRevision, toRevisionDto, type WorkRecord } from "../../repositories/works.repo.js";
 import { notFound } from "../../utils/errors.js";
 import { makeExcerpt } from "../../utils/text.js";
 import { serialize } from "../../utils/serialize.js";
-import { runPage } from "../../utils/pagination.js";
+import { decodeKey, keysetClause, sliceKeyset } from "../../utils/pagination.js";
 import {
-  chunkId,
-  deleteDocs,
+  insertRevisionChunks,
   prepareContent,
-  purgeChunksExcept,
-  readAllChunks,
-  readChunks,
-  writeChunks,
+  readDraftChunks,
+  readRevisionChunks,
+  readRevisionText,
+  replaceDraftChunks,
 } from "../../services/content.service.js";
 import type { PlatformSettings } from "../../services/settings.service.js";
 import { assertPostingAllowed } from "../works/works.guards.js";
+import { assertCategoryMatchesPrompt } from "../prompts/prompts.guards.js";
 
 type Logger = { error: (o: object, m: string) => void };
 
@@ -46,78 +38,34 @@ export interface RevisionMeta {
   totalBytes: number;
 }
 
-/** Number allocation is transactional so two simultaneous saves can never share a number. */
-async function reserveRevisionNumber(workId: string): Promise<number> {
-  return db.runTransaction(async (tx) => {
-    const snap = await tx.get(workRef(workId));
-    if (!snap.exists) throw notFound("WORK_NOT_FOUND", "That work does not exist.");
-    const next = ((snap.get("lastRevisionNumber") as number | undefined) ?? 0) + 1;
-    tx.update(workRef(workId), { lastRevisionNumber: next });
-    return next;
-  });
-}
-
-/** Removes any autosaved draft state once an explicit revision supersedes it. */
-export async function clearDraftState(workId: string): Promise<void> {
-  await db.recursiveDelete(draftStateRef(workId)).catch(() => undefined);
+/** Removes any autosaved draft once an explicit revision supersedes it. Chunks go with it (cascade). */
+async function clearDraftState(db: Pick<PoolClient, "query">, workId: string): Promise<void> {
+  await db.query(`DELETE FROM work_drafts WHERE work_id = $1`, [workId]);
 }
 
 /**
- * Makes `revisionId` the work's current content.
- *
- * Order matters: the work's chunks are written first (invisible, because readers resolve chunks
- * through `currentRevisionId`), then ONE transaction flips the pointer. A failure at any point
- * leaves readers on the previous, complete version. Stale chunks are cleaned up afterwards.
+ * Makes `revisionId` the work's current content. The text already lives in that revision's chunks,
+ * so this is one UPDATE that flips the pointer and copies the revision's metadata onto the work.
+ * A reader sees either the old complete version or the new complete one.
  */
-export async function activateRevision(
-  workId: string,
-  revisionId: string,
-  meta: RevisionMeta,
-  log: Logger,
-  chunks?: string[],
-): Promise<void> {
-  const prefix = `${revisionId}_`;
-  const col = workChunks(workId);
-
-  const already = await col.doc(chunkId(prefix, 0)).get();
-  if (!already.exists) {
-    const content = chunks ?? (await readAllChunks(revisionChunks(workId, revisionId), ""));
-    await writeChunks(col, prefix, content, { revisionId });
-  }
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(workRef(workId));
-    if (!snap.exists || snap.get("status") === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
-
-    tx.update(workRef(workId), {
-      title: meta.title,
-      titleLower: meta.title.toLowerCase(),
-      description: meta.description,
-      excerpt: meta.excerpt,
-      categoryId: meta.categoryId,
-      coverImageUrl: meta.coverImageUrl,
-      chunkCount: meta.chunkCount,
-      totalBytes: meta.totalBytes,
-      currentRevisionId: revisionId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    // A published work that changes category moves its public counter with it.
-    const oldCategory = snap.get("categoryId") as string;
-    if (snap.get("status") === "published" && oldCategory !== meta.categoryId) {
-      tx.set(db.collection("categories").doc(oldCategory), { publishedCount: FieldValue.increment(-1) }, { merge: true });
-      tx.set(db.collection("categories").doc(meta.categoryId), { publishedCount: FieldValue.increment(1) }, { merge: true });
-    }
-  });
-
-  // Best effort. Young chunks are skipped so a concurrent save cannot lose its own content.
-  await purgeChunksExcept(col, prefix, 120_000).catch((err: Error) =>
-    log.error({ workId, err: err.message }, "STALE_CHUNK_CLEANUP_FAILED"),
+async function activate(db: Pick<PoolClient, "query">, workId: string, revisionId: string, meta: RevisionMeta): Promise<void> {
+  await db.query(
+    `UPDATE works SET title = $2, description = $3, excerpt = $4, category_id = $5, cover_image_url = $6,
+            chunk_count = $7, total_bytes = $8, current_revision_id = $9, updated_at = inkspire_now()
+      WHERE id = $1`,
+    [workId, meta.title, meta.description, meta.excerpt, meta.categoryId, meta.coverImageUrl, meta.chunkCount, meta.totalBytes, revisionId],
   );
 }
 
+/** Used by moderation approval, which publishes a reviewed revision inside its own transaction. */
+export async function activateRevisionIn(db: Pick<PoolClient, "query">, workId: string, revisionId: string): Promise<void> {
+  const rev = await getRevisionRecord(workId, revisionId, db as PoolClient);
+  if (!rev) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+  await activate(db, workId, revisionId, rev);
+}
+
 export interface SaveRevisionArgs {
-  work: Doc;
+  work: WorkRecord;
   actor: AuthContext;
   input: RevisionInput;
   settings: PlatformSettings;
@@ -127,24 +75,21 @@ export interface SaveRevisionArgs {
   restoredFromRevisionId?: string | null;
 }
 
-/** Creates a new immutable revision. Existing revisions are never modified. */
-export async function saveRevision(args: SaveRevisionArgs, log: Logger) {
+/**
+ * Creates a new immutable revision. Number allocation, the revision, its chunks, the pointer flip
+ * and the autosave cleanup happen in one transaction, so two simultaneous saves can never share a
+ * number and a failure leaves nothing behind.
+ */
+export async function saveRevision(args: SaveRevisionArgs, _log: Logger) {
   const { work, actor, input, settings } = args;
   const workId = work.id;
 
   await assertPostingAllowed(actor.uid, input.categoryId, settings.defaultCategoryPostingAllowed);
+  await assertCategoryMatchesPrompt(pool, work.promptId, input.categoryId);
   const prepared = prepareContent(input.content, {
     thresholdBytes: settings.contentChunkThresholdBytes,
     maxWorkSizeBytes: settings.maxWorkSizeBytes,
   });
-
-  if (args.basedOnRevisionId) {
-    const base = await revisionRef(workId, args.basedOnRevisionId).get();
-    if (!base.exists) throw notFound("REVISION_NOT_FOUND", "The revision you based this on does not exist.");
-  }
-
-  const number = await reserveRevisionNumber(workId);
-  const revisionId = `r${number}`;
   const meta: RevisionMeta = {
     title: input.title,
     description: input.description,
@@ -155,85 +100,79 @@ export async function saveRevision(args: SaveRevisionArgs, log: Logger) {
     totalBytes: prepared.totalBytes,
   };
 
-  const writtenIds = await writeChunks(revisionChunks(workId, revisionId), "", prepared.chunks);
-  try {
-    // create() fails if the id exists, which is what makes revisions immutable.
-    await revisionRef(workId, revisionId).create({
-      revisionNumber: number,
-      ...meta,
-      createdAt: FieldValue.serverTimestamp(),
-      createdBy: actor.uid,
-      changeReason: args.changeReason ?? null,
-      basedOnRevisionId: args.basedOnRevisionId ?? null,
-      restoredFromRevisionId: args.restoredFromRevisionId ?? null,
-    });
-  } catch (err) {
-    await deleteDocs(revisionChunks(workId, revisionId), writtenIds).catch(() => undefined);
-    throw err;
-  }
+  return withTransaction(async (c) => {
+    const locked = await lockWork(c, workId);
+    if (!locked) throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    if (args.makeCurrent && locked.status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    if (args.basedOnRevisionId && !(await getRevisionRecord(workId, args.basedOnRevisionId, c))) {
+      throw notFound("REVISION_NOT_FOUND", "The revision you based this on does not exist.");
+    }
 
-  if (args.makeCurrent) {
-    await activateRevision(workId, revisionId, meta, log, prepared.chunks);
-    await clearDraftState(workId);
-  }
+    const number = locked.lastRevisionNumber + 1;
+    const revisionId = `r${number}`;
+    await c.query(`UPDATE works SET last_revision_number = $2 WHERE id = $1`, [workId, number]);
+    await c.query(
+      `INSERT INTO work_revisions (work_id, id, revision_number, title, description, excerpt, category_id, cover_image_url,
+                                   chunk_count, total_bytes, created_by, change_reason, based_on_revision_id, restored_from_revision_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [workId, revisionId, number, meta.title, meta.description, meta.excerpt, meta.categoryId, meta.coverImageUrl,
+        meta.chunkCount, meta.totalBytes, actor.uid, args.changeReason ?? null, args.basedOnRevisionId ?? null,
+        args.restoredFromRevisionId ?? null],
+    );
+    await insertRevisionChunks(c, workId, revisionId, prepared.chunks);
 
-  return { revisionId, revisionNumber: number, madeCurrent: args.makeCurrent };
+    if (args.makeCurrent) {
+      await activate(c, workId, revisionId, meta);
+      await clearDraftState(c, workId);
+    }
+    return { revisionId, revisionNumber: number, madeCurrent: args.makeCurrent };
+  });
 }
 
 export async function promoteRevision(
-  work: Doc,
+  work: WorkRecord,
   actor: AuthContext,
   revisionId: string,
   settings: PlatformSettings,
-  log: Logger,
+  _log: Logger,
 ) {
-  const snap = await revisionRef(work.id, revisionId).get();
-  if (!snap.exists) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+  const rev = await getRevisionRecord(work.id, revisionId);
+  if (!rev) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
   if (work.currentRevisionId === revisionId) return; // already current, nothing to do
-  const data = snap.data()!;
-  await assertPostingAllowed(actor.uid, data.categoryId as string, settings.defaultCategoryPostingAllowed);
-  await activateRevision(
-    work.id,
-    revisionId,
-    {
-      title: data.title,
-      description: data.description ?? "",
-      excerpt: data.excerpt ?? "",
-      categoryId: data.categoryId,
-      coverImageUrl: data.coverImageUrl ?? null,
-      chunkCount: data.chunkCount,
-      totalBytes: data.totalBytes,
-    },
-    log,
-  );
+  await assertPostingAllowed(actor.uid, rev.categoryId, settings.defaultCategoryPostingAllowed);
+  await assertCategoryMatchesPrompt(pool, work.promptId, rev.categoryId);
+  await withTransaction(async (c) => {
+    const locked = await lockWork(c, work.id);
+    if (!locked || locked.status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    await activate(c, work.id, revisionId, rev);
+  });
 }
 
 /** Restoring never overwrites history: it appends a new revision that copies an old one. */
 export async function restoreRevision(
-  work: Doc,
+  work: WorkRecord,
   actor: AuthContext,
   revisionId: string,
   settings: PlatformSettings,
   log: Logger,
 ) {
-  const snap = await revisionRef(work.id, revisionId).get();
-  if (!snap.exists) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
-  const data = snap.data()!;
-  const content = (await readAllChunks(revisionChunks(work.id, revisionId), "")).join("");
+  const rev = await getRevisionRecord(work.id, revisionId);
+  if (!rev) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+  const content = await readRevisionText(work.id, revisionId);
   return saveRevision(
     {
       work,
       actor,
       settings,
       makeCurrent: true,
-      changeReason: `Restored from version ${data.revisionNumber}`,
+      changeReason: `Restored from version ${rev.revisionNumber}`,
       basedOnRevisionId: revisionId,
       restoredFromRevisionId: revisionId,
       input: {
-        title: data.title,
-        description: data.description ?? "",
-        categoryId: data.categoryId,
-        coverImageUrl: data.coverImageUrl ?? null,
+        title: rev.title,
+        description: rev.description,
+        categoryId: rev.categoryId,
+        coverImageUrl: rev.coverImageUrl,
         content,
       },
     },
@@ -241,57 +180,40 @@ export async function restoreRevision(
   );
 }
 
-export const toRevisionDto = (id: string, data: FirebaseFirestore.DocumentData, currentRevisionId?: string) =>
-  serialize({
-    id,
-    revisionNumber: data.revisionNumber,
-    title: data.title,
-    description: data.description ?? "",
-    excerpt: data.excerpt ?? "",
-    categoryId: data.categoryId,
-    coverImageUrl: data.coverImageUrl ?? null,
-    chunkCount: data.chunkCount,
-    totalBytes: data.totalBytes,
-    createdAt: data.createdAt,
-    createdBy: data.createdBy,
-    changeReason: data.changeReason ?? null,
-    basedOnRevisionId: data.basedOnRevisionId ?? null,
-    restoredFromRevisionId: data.restoredFromRevisionId ?? null,
-    isCurrent: id === currentRevisionId,
-  });
-
-export async function listRevisions(work: Doc, opts: { cursor?: string; limit: number }) {
-  const { docs, nextCursor } = await runPage(revisionsCol(work.id).orderBy("revisionNumber", "desc"), {
-    limit: opts.limit,
-    cursor: opts.cursor,
-    cursorFields: (d) => [d.get("revisionNumber")],
-  });
-  return {
-    items: docs.map((d) => toRevisionDto(d.id, d.data(), work.currentRevisionId as string | undefined)),
-    nextCursor,
-  };
+export async function listRevisions(work: WorkRecord, opts: { cursor?: string; limit: number }) {
+  const values: unknown[] = [work.id];
+  const where = [`work_id = $1`];
+  const after = keysetClause(["revision_number"], ["int"], "desc", decodeKey(opts.cursor, ["int"]), values);
+  if (after) where.push(after);
+  values.push(opts.limit + 1);
+  const res = await pool.query(
+    `SELECT * FROM work_revisions WHERE ${where.join(" AND ")} ORDER BY revision_number DESC LIMIT $${values.length}`,
+    values,
+  );
+  const page = sliceKeyset(res.rows.map(mapRevision), opts.limit, (r) => [r.revisionNumber]);
+  return { items: page.rows.map((r) => toRevisionDto(r, work.currentRevisionId)), nextCursor: page.nextCursor };
 }
 
-export async function getRevision(work: Doc, revisionId: string) {
-  const snap = await revisionRef(work.id, revisionId).get();
-  if (!snap.exists) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
-  return toRevisionDto(snap.id, snap.data()!, work.currentRevisionId as string | undefined);
+export async function getRevision(work: WorkRecord, revisionId: string) {
+  const rev = await getRevisionRecord(work.id, revisionId);
+  if (!rev) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+  return toRevisionDto(rev, work.currentRevisionId);
 }
 
-export async function readRevisionContent(work: Doc, revisionId: string, after: number | undefined, limit: number) {
-  const exists = await revisionRef(work.id, revisionId).get();
-  if (!exists.exists) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
-  return readChunks(revisionChunks(work.id, revisionId), "", after, limit);
+export async function readRevisionContent(work: WorkRecord, revisionId: string, after: number | undefined, limit: number) {
+  if (!(await getRevisionRecord(work.id, revisionId))) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+  return readRevisionChunks(work.id, revisionId, after, limit);
 }
 
 /* ------------------------------ Autosave draft state ------------------------------ */
 
 /**
  * Autosave writes to a separate "current draft state". It never creates a revision, so typing
- * does not fill the history. Chunks are versioned so a half written save is never read.
+ * does not fill the history. The state row and its chunks are replaced in one transaction, so a
+ * half written save is never read.
  */
 export async function saveDraftState(
-  work: Doc,
+  work: WorkRecord,
   input: {
     title: string;
     description: string;
@@ -301,39 +223,50 @@ export async function saveDraftState(
     basedOnRevisionId?: string;
   },
   settings: PlatformSettings,
-  log: Logger,
+  _log: Logger,
 ) {
   const prepared = prepareContent(input.content, {
     thresholdBytes: settings.contentChunkThresholdBytes,
     maxWorkSizeBytes: settings.maxWorkSizeBytes,
   });
   const version = Date.now();
-  const prefix = `${version}_`;
-  await writeChunks(draftChunks(work.id), prefix, prepared.chunks, { version });
-  await draftStateRef(work.id).set({
-    version,
-    title: input.title,
-    description: input.description,
-    categoryId: input.categoryId,
-    coverImageUrl: input.coverImageUrl ?? null,
-    chunkCount: prepared.chunks.length,
-    totalBytes: prepared.totalBytes,
-    basedOnRevisionId: input.basedOnRevisionId ?? (work.currentRevisionId as string | undefined) ?? null,
-    updatedAt: FieldValue.serverTimestamp(),
+  await withTransaction(async (c) => {
+    // Deleted works cannot be autosaved. The lock also keeps a concurrent hard delete from racing the insert.
+    const locked = await lockWork(c, work.id);
+    if (!locked || locked.status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    await c.query(
+      `INSERT INTO work_drafts (work_id, version, title, description, category_id, cover_image_url, chunk_count, total_bytes, based_on_revision_id, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, inkspire_now())
+       ON CONFLICT (work_id) DO UPDATE SET version = EXCLUDED.version, title = EXCLUDED.title, description = EXCLUDED.description,
+         category_id = EXCLUDED.category_id, cover_image_url = EXCLUDED.cover_image_url, chunk_count = EXCLUDED.chunk_count,
+         total_bytes = EXCLUDED.total_bytes, based_on_revision_id = EXCLUDED.based_on_revision_id, updated_at = EXCLUDED.updated_at`,
+      [work.id, version, input.title, input.description, input.categoryId, input.coverImageUrl ?? null,
+        prepared.chunks.length, prepared.totalBytes, input.basedOnRevisionId ?? work.currentRevisionId ?? null],
+    );
+    await replaceDraftChunks(c, work.id, prepared.chunks);
   });
-  await purgeChunksExcept(draftChunks(work.id), prefix, 30_000).catch((err: Error) =>
-    log.error({ workId: work.id, err: err.message }, "DRAFT_CHUNK_CLEANUP_FAILED"),
-  );
   return { version, totalBytes: prepared.totalBytes };
 }
 
 export async function getDraftState(workId: string) {
-  const snap = await draftStateRef(workId).get();
-  return snap.exists ? serialize({ ...snap.data() }) : null;
+  const res = await pool.query(`SELECT * FROM work_drafts WHERE work_id = $1`, [workId]);
+  const r = res.rows[0];
+  if (!r) return null;
+  return serialize({
+    version: Number(r.version),
+    title: r.title,
+    description: r.description,
+    categoryId: r.category_id,
+    coverImageUrl: r.cover_image_url ?? null,
+    chunkCount: r.chunk_count,
+    totalBytes: r.total_bytes,
+    basedOnRevisionId: r.based_on_revision_id ?? null,
+    updatedAt: r.updated_at,
+  });
 }
 
 export async function readDraftContent(workId: string, after: number | undefined, limit: number) {
-  const snap = await draftStateRef(workId).get();
-  if (!snap.exists) throw notFound("DRAFT_NOT_FOUND", "There is no autosaved draft.");
-  return readChunks(draftChunks(workId), `${snap.get("version")}_`, after, limit);
+  const exists = await pool.query(`SELECT 1 FROM work_drafts WHERE work_id = $1`, [workId]);
+  if (!exists.rowCount) throw notFound("DRAFT_NOT_FOUND", "There is no autosaved draft.");
+  return readDraftChunks(workId, after, limit);
 }

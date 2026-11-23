@@ -8,6 +8,9 @@ export const pool = new pg.Pool({
   idleTimeoutMillis: 30_000,
 });
 
+/** Anything that can run a query: the pool, or one client inside a transaction. */
+export type Queryable = Pick<pg.Pool, "query">;
+
 export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   text: string,
   params: unknown[] = [],

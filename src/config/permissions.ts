@@ -9,6 +9,7 @@ export const PERMISSION_KEYS = [
   "permanentlyDeleteWorks",
   "viewAnalytics",
   "managePlatform",
+  "managePrompts",
 ] as const;
 
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
@@ -34,6 +35,9 @@ export const ROLE_RANK: Record<Role, number> = {
 
 export const ROLES = Object.keys(ROLE_RANK) as Role[];
 
+/** Powers that only an admin or a super admin can ever hold. A per user override cannot lift a lower role into them. */
+export const ADMIN_ONLY_PERMISSIONS: readonly PermissionKey[] = ["managePrompts"];
+
 export function resolvePermissions(
   role: Role,
   overrides?: Partial<Record<string, unknown>> | null,
@@ -44,6 +48,9 @@ export function resolvePermissions(
     for (const key of PERMISSION_KEYS) {
       if (typeof overrides[key] === "boolean") result[key] = overrides[key] as boolean;
     }
+  }
+  if (ROLE_RANK[role] < ROLE_RANK.admin) {
+    for (const key of ADMIN_ONLY_PERMISSIONS) result[key] = false;
   }
   return result;
 }

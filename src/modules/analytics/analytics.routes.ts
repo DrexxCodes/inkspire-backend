@@ -4,19 +4,19 @@ import { getAuth, requireUser } from "../../middleware/authenticate.js";
 import { requirePermission } from "../../middleware/authorize.js";
 import { query } from "../../config/postgres.js";
 import { listAllCategories } from "../../repositories/categories.repo.js";
-import { worksCol, hydrateWorks } from "../../repositories/works.repo.js";
-import { usersCol } from "../../repositories/users.repo.js";
+import { hydrateWorks, listWorkRows, WORK_SELECT } from "../../repositories/works.repo.js";
+import { getUsersByIds } from "../../repositories/users.repo.js";
+import { getTopAuthors } from "../../repositories/work-stats.repo.js";
 import { readStats } from "../../services/stats.service.js";
 import { parse } from "../../utils/validation.js";
 import { ok } from "../../utils/respond.js";
 import { clampLimit } from "../../utils/pagination.js";
-import type { Doc } from "../../types/domain.js";
 import { DEFAULT_POINTS, METRICS, TABLE, buildBuckets, fillSeries } from "./analytics.range.js";
 
 const guard = [requireUser, requirePermission("viewAnalytics")];
 
 export async function analyticsRoutes(app: FastifyInstance) {
-  // Summary cards and the moderation overview come from one counter document.
+  // Summary cards: the user total is a Firestore counter, work figures are counted in PostgreSQL.
   app.get("/summary", { preHandler: guard }, async () => {
     const s = await readStats();
     return ok({
@@ -65,25 +65,31 @@ export async function analyticsRoutes(app: FastifyInstance) {
 
   app.get("/top-works", { preHandler: guard }, async (req) => {
     const q = parse(z.object({ by: z.enum(["views", "likes", "comments"]).default("views"), limit: z.string().optional() }), req.query);
-    const field = { views: "viewCount", likes: "likeCount", comments: "commentCount" }[q.by];
-    const snap = await worksCol().where("status", "==", "published").orderBy(field, "desc").limit(clampLimit(q.limit, 10, 25)).get();
-    const works = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as Doc);
+    const col = { views: "view_count", likes: "like_count", comments: "comment_count" }[q.by];
+    const works = await listWorkRows(
+      `${WORK_SELECT} WHERE w.status = 'published' ORDER BY w.${col} DESC, w.id DESC LIMIT $1`,
+      [clampLimit(q.limit, 10, 25)],
+    );
     return ok({ items: await hydrateWorks(works, getAuthSafe(req)) });
   });
 
   app.get("/top-authors", { preHandler: guard }, async (req) => {
     const q = parse(z.object({ limit: z.string().optional() }), req.query);
-    const snap = await usersCol().orderBy("publishedWorkCount", "desc").limit(clampLimit(q.limit, 10, 25)).get();
+    const top = await getTopAuthors(clampLimit(q.limit, 10, 25));
+    const users = await getUsersByIds(top.map((t) => t.authorId));
     return ok({
-      items: snap.docs
-        .filter((d) => (d.get("publishedWorkCount") ?? 0) > 0)
-        .map((d) => ({
-          username: d.get("username"),
-          displayName: d.get("displayName"),
-          profilePhotoUrl: d.get("profilePhotoUrl") ?? null,
-          publishedWorks: d.get("publishedWorkCount") ?? 0,
-          likesReceived: d.get("likesReceived") ?? 0,
-        })),
+      items: top
+        .filter((t) => users.has(t.authorId))
+        .map((t) => {
+          const u = users.get(t.authorId)!;
+          return {
+            username: u.username,
+            displayName: u.displayName,
+            profilePhotoUrl: u.profilePhotoUrl ?? null,
+            publishedWorks: t.publishedWorks,
+            likesReceived: t.likesReceived,
+          };
+        }),
     });
   });
 }

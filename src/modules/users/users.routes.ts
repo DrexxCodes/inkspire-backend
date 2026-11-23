@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getAuth, optionalUser, requireUser } from "../../middleware/authenticate.js";
-import { getUserByUsername, getUserById, toPrivateProfile, toPublicProfile } from "../../repositories/users.repo.js";
+import { getUserByUsername, getUserById, privateProfileOf, publicProfileOf } from "../../repositories/users.repo.js";
 import { notFound, badRequest, forbidden } from "../../utils/errors.js";
 import { parse } from "../../utils/validation.js";
 import { ok, okPage } from "../../utils/respond.js";
@@ -22,7 +22,7 @@ export async function userRoutes(app: FastifyInstance) {
     if (!user || (user.accountStatus === "blocked" && !req.auth?.permissions.manageUsers)) {
       throw notFound("USER_NOT_FOUND", "That profile does not exist.");
     }
-    return ok({ profile: toPublicProfile(user) });
+    return ok({ profile: await publicProfileOf(user) });
   });
 
   app.get("/:username/works", { preHandler: optionalUser }, async (req) => {
@@ -44,7 +44,7 @@ export async function userRoutes(app: FastifyInstance) {
     const auth = getAuth(req);
     await updateProfile(auth.profile, parse(updateProfileSchema, req.body));
     const fresh = await getUserById(auth.uid);
-    return ok({ profile: toPrivateProfile(fresh!) });
+    return ok({ profile: await privateProfileOf(fresh!) });
   });
 
   // Multipart upload: one image file, JPEG/PNG/WebP, 5 MB maximum, verified by content.

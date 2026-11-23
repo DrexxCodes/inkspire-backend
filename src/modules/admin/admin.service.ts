@@ -1,21 +1,21 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
-import { adminAuth, db } from "../../config/firebase.js";
+import { adminAuth } from "../../config/firebase.js";
 import { env } from "../../config/env.js";
-import { query } from "../../config/postgres.js";
+import { pool, query } from "../../config/postgres.js";
 import { PERMISSION_KEYS, ROLES, resolvePermissions } from "../../config/permissions.js";
 import type { AccountStatus, AuthContext, Role, UserDoc } from "../../types/domain.js";
 import { getUserById, usersCol, toPublicProfile } from "../../repositories/users.repo.js";
+import { getAuthorStats, NO_STATS, statsOrEmpty, type AuthorStats } from "../../repositories/work-stats.repo.js";
 import { getCategory } from "../../repositories/categories.repo.js";
-import { getWork, workRef, worksCol, hydrateWorks } from "../../repositories/works.repo.js";
+import { getWork, hydrateWorks, listWorkRows, WORK_SELECT } from "../../repositories/works.repo.js";
 import { logAdmin, type AdminAction } from "../../services/audit.service.js";
 import { notify } from "../../services/notifications.service.js";
 import { invalidateProfile } from "../../services/profile-cache.service.js";
 import { deletePrefix } from "../../services/storage.service.js";
 import { AppError, badRequest, conflict, notFound, unavailable } from "../../utils/errors.js";
-import { clampLimit, docId, runPage } from "../../utils/pagination.js";
+import { clampLimit, decodeKey, docId, keysetClause, runPage, sliceKeyset } from "../../utils/pagination.js";
 import { serialize } from "../../utils/serialize.js";
-import type { Doc } from "../../types/domain.js";
 import { assertCanAssignRole, assertCanManageUser } from "./admin.rules.js";
 
 type Logger = Parameters<typeof logAdmin>[1];
@@ -26,16 +26,24 @@ export const permissionsSchema = z.object({
 });
 export const statusSchema = z.object({ reason: z.string().trim().max(500).optional() });
 
+async function adminDto(u: UserDoc) {
+  try {
+    return toAdminUserDto(u, await getAuthorStats([u.id]).then((m) => statsOrEmpty(m, u.id)));
+  } catch {
+    return toAdminUserDto(u);
+  }
+}
+
 async function loadTarget(uid: string): Promise<UserDoc> {
   const user = await getUserById(uid);
   if (!user) throw notFound("USER_NOT_FOUND", "That user does not exist.");
   return user;
 }
 
-export function toAdminUserDto(u: UserDoc) {
+export function toAdminUserDto(u: UserDoc, stats: AuthorStats = NO_STATS) {
   return serialize({
     id: u.id,
-    ...toPublicProfile(u),
+    ...toPublicProfile(u, stats),
     email: u.email ?? null,
     role: u.role,
     permissions: resolvePermissions(u.role, u.permissions),
@@ -49,6 +57,21 @@ export function toAdminUserDto(u: UserDoc) {
 
 /* ---------------------------------- Users list ---------------------------------- */
 
+/** Work stats are supplementary. If Postgres is unreachable the list still loads, with zeros. */
+async function withStats(docs: FirebaseFirestore.QueryDocumentSnapshot[]) {
+  let stats = new Map<string, AuthorStats>();
+  try {
+    stats = await getAuthorStats(docs.map((d) => d.id));
+  } catch {
+    /* fall back to zeros */
+  }
+  return docs.map((d) => toAdminUserDto({ id: d.id, ...d.data() } as UserDoc, statsOrEmpty(stats, d.id)));
+}
+
+/**
+ * There is no overall cap: pages of 20 (at most 50 per request) are walked with a cursor, so every
+ * user is reachable. Search is a username prefix match, or an exact email match.
+ */
 export async function searchUsers(params: { q?: string; role?: string; status?: string; cursor?: string; limit?: string }) {
   let q: FirebaseFirestore.Query = usersCol();
   const term = params.q?.trim().toLowerCase();
@@ -56,18 +79,19 @@ export async function searchUsers(params: { q?: string; role?: string; status?: 
   if (term?.includes("@")) {
     q = q.where("email", "==", term).limit(1);
     const snap = await q.get();
-    return { items: snap.docs.map((d) => toAdminUserDto({ id: d.id, ...d.data() } as UserDoc)), nextCursor: null };
+    return { items: await withStats(snap.docs), nextCursor: null };
   }
   if (params.role) q = q.where("role", "==", params.role);
   if (params.status) q = q.where("accountStatus", "==", params.status);
   if (term) {
-    q = q.where("usernameLower", ">=", term).where("usernameLower", "<", `${term}`).orderBy("usernameLower").orderBy(docId());
+    // "\uf8ff" is the highest code point, so this range is exactly "starts with term".
+    q = q.where("usernameLower", ">=", term).where("usernameLower", "<", `${term}\uf8ff`).orderBy("usernameLower").orderBy(docId());
     const { docs, nextCursor } = await runPage(q, {
       limit: clampLimit(params.limit, 20, 50),
       cursor: params.cursor,
       cursorFields: (d) => [d.get("usernameLower"), d.id],
     });
-    return { items: docs.map((d) => toAdminUserDto({ id: d.id, ...d.data() } as UserDoc)), nextCursor };
+    return { items: await withStats(docs), nextCursor };
   }
   q = q.orderBy("createdAt", "desc").orderBy(docId(), "desc");
   const { docs, nextCursor } = await runPage(q, {
@@ -75,7 +99,7 @@ export async function searchUsers(params: { q?: string; role?: string; status?: 
     cursor: params.cursor,
     cursorFields: (d) => [d.get("createdAt"), d.id],
   });
-  return { items: docs.map((d) => toAdminUserDto({ id: d.id, ...d.data() } as UserDoc)), nextCursor };
+  return { items: await withStats(docs), nextCursor };
 }
 
 /**
@@ -113,7 +137,7 @@ export async function getUserDetail(uid: string, log?: Logger) {
     ),
   ]);
   return {
-    user: toAdminUserDto(user),
+    user: await adminDto(user),
     categoryPermissions: perms.docs.map((d) => ({ categoryId: d.id, canPost: d.get("canPost") === true })),
     moderationHistory: history.rows,
     adminActivity: activity.rows,
@@ -126,7 +150,7 @@ export async function getUserDetail(uid: string, log?: Logger) {
 async function setStatus(actor: AuthContext, uid: string, status: AccountStatus, action: AdminAction, reason: string | undefined, log: Logger) {
   const target = await loadTarget(uid);
   assertCanManageUser({ uid: actor.uid, role: actor.profile.role }, { id: uid, role: target.role });
-  if (target.accountStatus === status) return toAdminUserDto(target); // idempotent
+  if (target.accountStatus === status) return adminDto(target); // idempotent
   await usersCol().doc(uid).update({
     accountStatus: status,
     statusReason: reason ?? null,
@@ -138,7 +162,7 @@ async function setStatus(actor: AuthContext, uid: string, status: AccountStatus,
     await adminAuth.revokeRefreshTokens(uid).catch((err: Error) => log.error({ uid, err: err.message }, "REVOKE_TOKENS_FAILED"));
   }
   await logAdmin({ adminId: actor.uid, action, targetType: "user", targetId: uid, metadata: { from: target.accountStatus, to: status, reason: reason ?? null } }, log);
-  return toAdminUserDto((await getUserById(uid))!);
+  return adminDto((await getUserById(uid))!);
 }
 
 export const disableUser = (a: AuthContext, uid: string, reason: string | undefined, log: Logger) => setStatus(a, uid, "disabled", "USER_DISABLED", reason, log);
@@ -153,7 +177,7 @@ export async function changeRole(actor: AuthContext, uid: string, role: Role, lo
   const target = await loadTarget(uid);
   assertCanManageUser({ uid: actor.uid, role: actor.profile.role }, { id: uid, role: target.role });
   assertCanAssignRole({ uid: actor.uid, role: actor.profile.role }, role);
-  if (target.role === role) return toAdminUserDto(target);
+  if (target.role === role) return adminDto(target);
 
   // Never leave the platform without a super admin.
   if (target.role === "super_admin") {
@@ -165,7 +189,7 @@ export async function changeRole(actor: AuthContext, uid: string, role: Role, lo
   await usersCol().doc(uid).update({ role, updatedAt: FieldValue.serverTimestamp() });
   invalidateProfile(uid);
   await logAdmin({ adminId: actor.uid, action: "USER_ROLE_CHANGED", targetType: "user", targetId: uid, metadata: { from: target.role, to: role } }, log);
-  return toAdminUserDto((await getUserById(uid))!);
+  return adminDto((await getUserById(uid))!);
 }
 
 export async function changePermissions(actor: AuthContext, uid: string, patch: Record<string, boolean | undefined>, log: Logger) {
@@ -183,7 +207,7 @@ export async function changePermissions(actor: AuthContext, uid: string, patch: 
   await usersCol().doc(uid).update({ permissions: next, updatedAt: FieldValue.serverTimestamp() });
   invalidateProfile(uid);
   await logAdmin({ adminId: actor.uid, action: "USER_PERMISSION_CHANGED", targetType: "user", targetId: uid, metadata: { patch } }, log);
-  return toAdminUserDto((await getUserById(uid))!);
+  return adminDto((await getUserById(uid))!);
 }
 
 export async function setCategoryPermission(actor: AuthContext, uid: string, categoryId: string, canPost: boolean, log: Logger) {
@@ -207,7 +231,7 @@ export async function setVerification(actor: AuthContext, uid: string, verified:
     throw new AppError("SUPER_ADMIN_ONLY", "Only a super admin can do this.", 403);
   }
   const target = await loadTarget(uid);
-  if ((target.verified === true) === verified) return toAdminUserDto(target);
+  if ((target.verified === true) === verified) return adminDto(target);
 
   await usersCol().doc(uid).update(
     verified
@@ -222,7 +246,7 @@ export async function setVerification(actor: AuthContext, uid: string, verified:
   if (verified) {
     await notify(uid, { type: "BADGE_CONFERRED", title: "You have been verified", body: "Inkspire has conferred a verification badge on your profile." }, log);
   }
-  return toAdminUserDto((await getUserById(uid))!);
+  return adminDto((await getUserById(uid))!);
 }
 
 /**
@@ -251,19 +275,22 @@ export async function triggerPasswordReset(actor: AuthContext, uid: string, log:
 /* ------------------------------------ Works ------------------------------------ */
 
 export async function listWorksForAdmin(params: { status?: string; moderation?: string; cursor?: string; limit?: string }) {
-  let q: FirebaseFirestore.Query = worksCol();
-  if (params.moderation) q = q.where("moderationStatus", "==", params.moderation);
-  else if (params.status) q = q.where("status", "==", params.status);
-  q = q.orderBy("updatedAt", "desc").orderBy(docId(), "desc");
-  const { docs, nextCursor } = await runPage(q, {
-    limit: clampLimit(params.limit, 20, 50),
-    cursor: params.cursor,
-    cursorFields: (d) => [d.get("updatedAt"), d.id],
-  });
-  const works = docs.map((d) => ({ id: d.id, ...d.data() }) as Doc);
+  const limit = clampLimit(params.limit, 20, 50);
+  const values: unknown[] = [];
+  const where: string[] = [];
+  if (params.moderation) { values.push(params.moderation); where.push(`w.moderation_status = $${values.length}`); }
+  else if (params.status) { values.push(params.status); where.push(`w.status = $${values.length}`); }
+  const after = keysetClause(["w.updated_at", "w.id"], ["ts", "text"], "desc", decodeKey(params.cursor, ["ts", "text"]), values);
+  if (after) where.push(after);
+  values.push(limit + 1);
+  const rows = await listWorkRows(
+    `${WORK_SELECT} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY w.updated_at DESC, w.id DESC LIMIT $${values.length}`,
+    values,
+  );
+  const page = sliceKeyset(rows, limit, (w) => [w.updatedAt, w.id]);
   // `viewer` is a moderator here, so moderation details are included.
-  const dtos = await hydrateWorks(works, { permissions: { moderateWorks: true } } as unknown as AuthContext);
-  return { items: dtos, nextCursor };
+  const dtos = await hydrateWorks(page.rows, { permissions: { moderateWorks: true } } as unknown as AuthContext);
+  return { items: dtos, nextCursor: page.nextCursor };
 }
 
 /**
@@ -277,7 +304,8 @@ export async function permanentlyDeleteWork(actor: AuthContext, workId: string, 
   if (work.status !== "deleted") {
     throw conflict("WORK_NOT_SOFT_DELETED", "Delete the work first. Permanent deletion is only available for deleted works.");
   }
-  await db.recursiveDelete(workRef(workId));
+  // Revisions, chunks, drafts, likes, comments, review requests and prompt wins go with it (ON DELETE CASCADE).
+  await pool.query(`DELETE FROM works WHERE id = $1`, [workId]);
   await deletePrefix(`works/${workId}`).catch((err: Error) => log.error({ workId, err: err.message }, "MEDIA_CLEANUP_FAILED"));
   await logAdmin(
     { adminId: actor.uid, action: "WORK_PERMANENTLY_DELETED", targetType: "work", targetId: workId, metadata: { authorId: work.authorId, title: work.title } },

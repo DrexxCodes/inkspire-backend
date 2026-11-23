@@ -35,7 +35,6 @@ for (const [name, description] of CATEGORIES) {
     description,
     imageUrl: null,
     isActive: true,
-    publishedCount: 0,
     createdBy: "seed",
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),

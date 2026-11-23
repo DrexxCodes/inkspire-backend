@@ -1,5 +1,6 @@
 import { db } from "../config/firebase.js";
 import type { UserDoc } from "../types/domain.js";
+import { NO_STATS, getOneAuthorStats, type AuthorStats } from "./work-stats.repo.js";
 
 export const usersCol = () => db.collection("users");
 export const usernamesCol = () => db.collection("usernames");
@@ -41,7 +42,8 @@ export function toAuthorSummary(u: UserDoc | undefined | null) {
   };
 }
 
-export function toPublicProfile(u: UserDoc) {
+/** Work totals come from PostgreSQL (see work-stats.repo), so every profile is built with them passed in. */
+export function toPublicProfile(u: UserDoc, stats: AuthorStats) {
   return {
     username: u.username,
     displayName: u.displayName,
@@ -52,16 +54,29 @@ export function toPublicProfile(u: UserDoc) {
     verified: u.verified === true,
     createdAt: u.createdAt,
     stats: {
-      publishedWorks: Math.max(0, u.publishedWorkCount ?? 0),
-      likesReceived: Math.max(0, u.likesReceived ?? 0),
+      publishedWorks: Math.max(0, stats.publishedWorks),
+      likesReceived: Math.max(0, stats.likesReceived),
     },
     accountStatus: u.accountStatus,
   };
 }
 
 /** The signed in user's own view of their profile. Still never includes internal fields. */
-export function toPrivateProfile(u: UserDoc) {
-  return { ...toPublicProfile(u), email: u.email ?? null, role: u.role };
+export function toPrivateProfile(u: UserDoc, stats: AuthorStats) {
+  return { ...toPublicProfile(u, stats), email: u.email ?? null, role: u.role };
+}
+
+/**
+ * Convenience for single profile responses: loads the author's work totals, then builds the DTO.
+ * The totals are decoration, so if PostgreSQL is unreachable the profile still loads (with zeros).
+ * That matters most for /auth/me, which every sign in depends on.
+ */
+export async function publicProfileOf(u: UserDoc) {
+  return toPublicProfile(u, await getOneAuthorStats(u.id).catch(() => NO_STATS));
+}
+
+export async function privateProfileOf(u: UserDoc) {
+  return toPrivateProfile(u, await getOneAuthorStats(u.id).catch(() => NO_STATS));
 }
 
 /** All explicit category permissions for a user in one read, as categoryId -> canPost. */

@@ -18,7 +18,9 @@ Fastify 5, TypeScript (ESM, NodeNext), Firebase Admin, `pg`, Supabase Storage, Z
 | `SETTINGS_CACHE_TTL_MS` | How long platform settings are cached |
 | `SUPER_ADMIN_EMAILS` | Verified emails that become `super_admin` when they register |
 
-3. **PostgreSQL**: run `sql/schema.sql` in the Supabase SQL editor. It creates `daily_metrics`, `monthly_metrics`, `yearly_metrics`, `analytics_events`, `moderation_actions` and `admin_audit_logs`, enables row level security and revokes `anon` and `authenticated` access. Only the server connection uses these tables.
+3. **PostgreSQL**: run `pnpm db:migrate` (or `pnpm db:migrate:prod`). It applies `sql/schema.sql` and then `sql/002_works_and_prompts.sql`, in order, and is safe to run again. You can also paste both files into the Supabase SQL editor, `schema.sql` first. Together they create the analytics and audit tables, and the **posts** tables (`works`, `work_revisions`, `work_revision_chunks`, `work_drafts`, `work_likes`, `work_comments`, `work_review_requests`, `work_idempotency`) and the **prompts** tables (`prompts`, `prompt_winners`). Row level security is enabled and `anon` and `authenticated` access is revoked. Only the server connection uses these tables.
+
+   Posts live in PostgreSQL. Users, categories, settings, notifications and Firebase Auth stay on Firebase, so a work stores its author and category as plain Firebase ids. Work totals (published count, likes received, platform summary) are counted from PostgreSQL rather than kept as Firestore counters.
 4. **Firestore**: log in, deploy the rules and indexes, then verify:
    ```
    firebase login

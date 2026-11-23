@@ -1,55 +1,56 @@
-import { createHash } from "node:crypto";
-import { FieldValue, type Query } from "firebase-admin/firestore";
 import { z } from "zod";
-import { db } from "../../config/firebase.js";
-import type { AuthContext, Doc } from "../../types/domain.js";
+import { pool, withTransaction } from "../../config/postgres.js";
+import type { AuthContext } from "../../types/domain.js";
 import {
-  draftChunks,
+  WORK_SELECT,
   getWork,
+  hasLiked,
   hydrateWorks,
-  likesCol,
-  revisionChunks,
-  revisionRef,
-  reviewsCol,
-  workChunks,
-  workRef,
-  worksCol,
+  listWorkRows,
+  lockWork,
 } from "../../repositories/works.repo.js";
-import { badRequest, conflict, notFound } from "../../utils/errors.js";
+import { conflict, notFound } from "../../utils/errors.js";
 import { makeExcerpt } from "../../utils/text.js";
-import { clampLimit, docId, runPage } from "../../utils/pagination.js";
-import { deleteDocs, prepareContent, readChunks, writeChunks } from "../../services/content.service.js";
+import { escapeLike, newId } from "../../utils/ids.js";
+import { clampLimit, decodeKey, keysetClause, sliceKeyset, type KeyType } from "../../utils/pagination.js";
+import { insertRevisionChunks, prepareContent, readRevisionChunks } from "../../services/content.service.js";
 import { settingsService } from "../../services/settings.service.js";
-import { applyPublishedDelta, statsIncrement, statsRef } from "../../services/stats.service.js";
 import { track } from "../../services/analytics.service.js";
 import { logAdmin, logModeration } from "../../services/audit.service.js";
 import { softDelete as softDeleteTransition } from "../moderation/moderation.rules.js";
+import { assertCanEnterPrompt, lockEntrySlot } from "../prompts/prompts.guards.js";
 import { assertPostingAllowed, loadOwnWork, loadVisibleWork } from "./works.guards.js";
 import { createWorkSchema, listQuerySchema } from "./works.schemas.js";
 
 type Logger = Parameters<typeof track>[1] & Parameters<typeof logAdmin>[1];
 
-const idemRef = (uid: string, key: string) =>
-  db.collection("idempotency").doc(createHash("sha256").update(`${uid}:${key}`).digest("hex").slice(0, 40));
-
-const isAlreadyExists = (err: unknown) => (err as { code?: number })?.code === 6;
+class DuplicateRequest extends Error {}
 
 export async function getWorkDto(workId: string, auth?: AuthContext | null) {
   const work = await loadVisibleWork(workId, auth);
   const [dto] = await hydrateWorks([work], auth);
-  let liked = false;
-  if (auth) liked = (await likesCol(workId).doc(auth.uid).get()).exists;
+  const liked = auth ? await hasLiked(workId, auth.uid) : false;
   return { ...dto!, viewer: { isAuthor: auth?.uid === work.authorId, liked } };
+}
+
+async function findIdempotent(uid: string, key: string): Promise<string | null> {
+  const res = await pool.query(`SELECT work_id FROM work_idempotency WHERE user_id = $1 AND idem_key = $2`, [uid, key]);
+  return res.rows[0]?.work_id ?? null;
 }
 
 /* ---------------------------------- Create ---------------------------------- */
 
+/**
+ * Posting, in one transaction: the work, its first revision and that revision's text chunks, and
+ * the idempotency marker. Either all of it exists or none of it does, so there are no orphaned
+ * chunks to clean up and nothing half written is ever visible.
+ */
 export async function createWork(auth: AuthContext, input: z.output<typeof createWorkSchema>, log: Logger) {
   const settings = await settingsService.get();
 
   if (input.idempotencyKey) {
-    const prior = await idemRef(auth.uid, input.idempotencyKey).get();
-    if (prior.exists) return getWorkDto(prior.get("workId") as string, auth);
+    const prior = await findIdempotent(auth.uid, input.idempotencyKey);
+    if (prior) return getWorkDto(prior, auth);
   }
 
   await assertPostingAllowed(auth.uid, input.categoryId, settings.defaultCategoryPostingAllowed);
@@ -58,80 +59,49 @@ export async function createWork(auth: AuthContext, input: z.output<typeof creat
     maxWorkSizeBytes: settings.maxWorkSizeBytes,
   });
 
-  const workId = worksCol().doc().id;
+  const workId = newId();
   const revisionId = "r1";
   const excerpt = makeExcerpt(input.content);
   const publish = input.publish;
 
-  // 1. Content first. Nothing points at these chunks yet, so a failure leaves nothing visible.
-  const revisionIds = await writeChunks(revisionChunks(workId, revisionId), "", prepared.chunks);
-  let workChunkIds: string[] = [];
-
   try {
-    workChunkIds = await writeChunks(workChunks(workId), `${revisionId}_`, prepared.chunks, { revisionId });
-
-    // 2. Metadata last, in one atomic batch: work, first revision, counters, idempotency marker.
-    const batch = db.batch();
-    batch.create(workRef(workId), {
-      authorId: auth.uid,
-      title: input.title,
-      titleLower: input.title.toLowerCase(),
-      description: input.description,
-      excerpt,
-      categoryId: input.categoryId,
-      coverImageUrl: input.coverImageUrl ?? null,
-      status: publish ? "published" : "draft",
-      visibility: input.visibility,
-      moderationStatus: "clean",
-      moderation: null,
-      chunkCount: prepared.chunks.length,
-      totalBytes: prepared.totalBytes,
-      likeCount: 0,
-      commentCount: 0,
-      shareCount: 0,
-      viewCount: 0,
-      currentRevisionId: revisionId,
-      lastRevisionNumber: 1,
-      publishCount: publish ? 1 : 0,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-      publishedAt: publish ? FieldValue.serverTimestamp() : null,
-      deletedAt: null,
-      deletedBy: null,
+    await withTransaction(async (c) => {
+      if (input.promptId) {
+        await lockEntrySlot(c, input.promptId, auth.uid);
+        await assertCanEnterPrompt(c, { promptId: input.promptId, userId: auth.uid, categoryId: input.categoryId });
+      }
+      await c.query(
+        `INSERT INTO works (id, author_id, title, description, excerpt, category_id, prompt_id, cover_image_url,
+                            status, visibility, chunk_count, total_bytes, current_revision_id, last_revision_number,
+                            publish_count, published_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14, CASE WHEN $15 THEN inkspire_now() END)`,
+        [
+          workId, auth.uid, input.title, input.description, excerpt, input.categoryId, input.promptId ?? null,
+          input.coverImageUrl ?? null, publish ? "published" : "draft", input.visibility,
+          prepared.chunks.length, prepared.totalBytes, revisionId, publish ? 1 : 0, publish,
+        ],
+      );
+      await c.query(
+        `INSERT INTO work_revisions (work_id, id, revision_number, title, description, excerpt, category_id,
+                                     cover_image_url, chunk_count, total_bytes, created_by, change_reason)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, 'Original')`,
+        [workId, revisionId, input.title, input.description, excerpt, input.categoryId, input.coverImageUrl ?? null,
+          prepared.chunks.length, prepared.totalBytes, auth.uid],
+      );
+      await insertRevisionChunks(c, workId, revisionId, prepared.chunks);
+      if (input.idempotencyKey) {
+        const marker = await c.query(
+          `INSERT INTO work_idempotency (user_id, idem_key, work_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [auth.uid, input.idempotencyKey, workId],
+        );
+        // A concurrent retry with the same key won the race. Undo this attempt and return theirs.
+        if (marker.rowCount === 0) throw new DuplicateRequest();
+      }
     });
-    batch.create(revisionRef(workId, revisionId), {
-      revisionNumber: 1,
-      title: input.title,
-      description: input.description,
-      excerpt,
-      categoryId: input.categoryId,
-      coverImageUrl: input.coverImageUrl ?? null,
-      chunkCount: prepared.chunks.length,
-      totalBytes: prepared.totalBytes,
-      createdAt: FieldValue.serverTimestamp(),
-      createdBy: auth.uid,
-      changeReason: "Original",
-      basedOnRevisionId: null,
-      restoredFromRevisionId: null,
-    });
-    if (input.idempotencyKey) {
-      batch.create(idemRef(auth.uid, input.idempotencyKey), {
-        workId,
-        userId: auth.uid,
-        createdAt: FieldValue.serverTimestamp(),
-      });
-    }
-    batch.set(statsRef(), statsIncrement({ totalWorks: 1 }), { merge: true });
-    if (publish) applyPublishedDelta(batch, { categoryId: input.categoryId, authorId: auth.uid }, 1);
-    await batch.commit();
   } catch (err) {
-    // Roll back the staged content so no orphaned chunks remain.
-    await deleteDocs(workChunks(workId), workChunkIds).catch(() => undefined);
-    await deleteDocs(revisionChunks(workId, revisionId), revisionIds).catch(() => undefined);
-    // A concurrent retry with the same idempotency key already created the work.
-    if (input.idempotencyKey && isAlreadyExists(err)) {
-      const prior = await idemRef(auth.uid, input.idempotencyKey).get();
-      if (prior.exists) return getWorkDto(prior.get("workId") as string, auth);
+    if (err instanceof DuplicateRequest && input.idempotencyKey) {
+      const prior = await findIdempotent(auth.uid, input.idempotencyKey);
+      if (prior) return getWorkDto(prior, auth);
     }
     throw err;
   }
@@ -143,42 +113,57 @@ export async function createWork(auth: AuthContext, input: z.output<typeof creat
 
 /* ---------------------------------- Lists ---------------------------------- */
 
-const SORT_FIELD = {
-  latest: "publishedAt",
-  popular: "likeCount",
-  viewed: "viewCount",
-  discussed: "commentCount",
-} as const;
+const SORT = {
+  latest: { expr: "w.published_at", type: "ts" },
+  popular: { expr: "w.like_count", type: "int" },
+  viewed: { expr: "w.view_count", type: "int" },
+  discussed: { expr: "w.comment_count", type: "int" },
+} as const satisfies Record<string, { expr: string; type: KeyType }>;
 
 export async function listPublicWorks(params: z.output<typeof listQuerySchema>, auth?: AuthContext | null) {
   const limit = clampLimit(params.limit, 12, 30);
-  let query: Query = worksCol().where("status", "==", "published").where("visibility", "==", "public");
-
-  const needle = params.q?.toLowerCase();
-  if (needle && needle.length >= 2) {
-    // Basic prefix search on the title. Richer search is a later phase.
-    query = query
-      .where("titleLower", ">=", needle)
-      .where("titleLower", "<", `${needle}`)
-      .orderBy("titleLower")
-      .orderBy(docId());
-    const { docs, nextCursor } = await runPage(query, {
-      limit,
-      cursor: params.cursor,
-      cursorFields: (d) => [d.get("titleLower"), d.id],
-    });
-    return { items: await hydrateWorks(docs.map((d) => ({ id: d.id, ...d.data() }) as Doc), auth), nextCursor };
+  const values: unknown[] = [];
+  const where = [`w.status = 'published'`, `w.visibility = 'public'`];
+  if (params.category) {
+    values.push(params.category);
+    where.push(`w.category_id = $${values.length}`);
+  }
+  if (params.prompt) {
+    values.push(params.prompt);
+    where.push(`w.prompt_id = $${values.length}`);
   }
 
-  if (params.category) query = query.where("categoryId", "==", params.category);
-  const field = SORT_FIELD[params.sort];
-  query = query.orderBy(field, "desc").orderBy(docId(), "desc");
-  const { docs, nextCursor } = await runPage(query, {
-    limit,
-    cursor: params.cursor,
-    cursorFields: (d) => [d.get(field), d.id],
-  });
-  return { items: await hydrateWorks(docs.map((d) => ({ id: d.id, ...d.data() }) as Doc), auth), nextCursor };
+  let exprs: string[];
+  let types: KeyType[];
+  let dir: "asc" | "desc";
+  let order: string;
+  const needle = params.q?.toLowerCase();
+  if (needle && needle.length >= 2) {
+    // Prefix search on the title, ordered alphabetically. Richer search is a later phase.
+    values.push(`${escapeLike(needle)}%`);
+    where.push(`w.title_lower LIKE $${values.length}`);
+    exprs = ["w.title_lower", "w.id"];
+    types = ["text", "text"];
+    dir = "asc";
+    order = "w.title_lower ASC, w.id ASC";
+  } else {
+    const s = SORT[params.sort];
+    exprs = [s.expr, "w.id"];
+    types = [s.type, "text"];
+    dir = "desc";
+    order = `${s.expr} DESC, w.id DESC`;
+  }
+  const after = keysetClause(exprs, types, dir, decodeKey(params.cursor, types), values);
+  if (after) where.push(after);
+  values.push(limit + 1);
+
+  const rows = await listWorkRows(`${WORK_SELECT} WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT $${values.length}`, values);
+  const page = sliceKeyset(rows, limit, (w) =>
+    needle && needle.length >= 2
+      ? [w.title.toLowerCase(), w.id]
+      : [params.sort === "latest" ? w.publishedAt : params.sort === "popular" ? w.likeCount : params.sort === "viewed" ? w.viewCount : w.commentCount, w.id],
+  );
+  return { items: await hydrateWorks(page.rows, auth), nextCursor: page.nextCursor };
 }
 
 export async function listMyWorks(
@@ -186,17 +171,23 @@ export async function listMyWorks(
   params: { status?: string; cursor?: string; limit?: string },
 ) {
   const limit = clampLimit(params.limit, 20, 50);
-  let query: Query = worksCol().where("authorId", "==", auth.uid);
-  if (params.status) query = query.where("status", "==", params.status);
-  query = query.orderBy("updatedAt", "desc").orderBy(docId(), "desc");
-  const { docs, nextCursor } = await runPage(query, {
-    limit,
-    cursor: params.cursor,
-    cursorFields: (d) => [d.get("updatedAt"), d.id],
-  });
+  const types: KeyType[] = ["ts", "text"];
   // Soft deleted works disappear from the author's normal lists.
-  const works = docs.map((d) => ({ id: d.id, ...d.data() }) as Doc).filter((w) => w.status !== "deleted");
-  return { items: await hydrateWorks(works, auth), nextCursor };
+  const values: unknown[] = [auth.uid];
+  const where = [`w.author_id = $1`, `w.status <> 'deleted'`];
+  if (params.status) {
+    values.push(params.status);
+    where.push(`w.status = $${values.length}`);
+  }
+  const after = keysetClause(["w.updated_at", "w.id"], types, "desc", decodeKey(params.cursor, types), values);
+  if (after) where.push(after);
+  values.push(limit + 1);
+  const rows = await listWorkRows(
+    `${WORK_SELECT} WHERE ${where.join(" AND ")} ORDER BY w.updated_at DESC, w.id DESC LIMIT $${values.length}`,
+    values,
+  );
+  const page = sliceKeyset(rows, limit, (w) => [w.updatedAt, w.id]);
+  return { items: await hydrateWorks(page.rows, auth), nextCursor: page.nextCursor };
 }
 
 export async function listAuthorPublicWorks(
@@ -204,18 +195,18 @@ export async function listAuthorPublicWorks(
   params: { cursor?: string; limit: number },
   auth?: AuthContext | null,
 ) {
-  const query = worksCol()
-    .where("authorId", "==", authorId)
-    .where("status", "==", "published")
-    .where("visibility", "==", "public")
-    .orderBy("publishedAt", "desc")
-    .orderBy(docId(), "desc");
-  const { docs, nextCursor } = await runPage(query, {
-    limit: params.limit,
-    cursor: params.cursor,
-    cursorFields: (d) => [d.get("publishedAt"), d.id],
-  });
-  return { items: await hydrateWorks(docs.map((d) => ({ id: d.id, ...d.data() }) as Doc), auth), nextCursor };
+  const types: KeyType[] = ["ts", "text"];
+  const values: unknown[] = [authorId];
+  const where = [`w.author_id = $1`, `w.status = 'published'`, `w.visibility = 'public'`];
+  const after = keysetClause(["w.published_at", "w.id"], types, "desc", decodeKey(params.cursor, types), values);
+  if (after) where.push(after);
+  values.push(params.limit + 1);
+  const rows = await listWorkRows(
+    `${WORK_SELECT} WHERE ${where.join(" AND ")} ORDER BY w.published_at DESC, w.id DESC LIMIT $${values.length}`,
+    values,
+  );
+  const page = sliceKeyset(rows, params.limit, (w) => [w.publishedAt, w.id]);
+  return { items: await hydrateWorks(page.rows, auth), nextCursor: page.nextCursor };
 }
 
 /* ---------------------------------- Reading ---------------------------------- */
@@ -231,11 +222,11 @@ export async function readWorkContent(
   opts: { after?: number; limit: number; revisionId?: string },
 ) {
   const work = await loadVisibleWork(workId, auth);
-  const current = work.currentRevisionId as string;
+  const current = work.currentRevisionId;
   if (opts.revisionId && opts.revisionId !== current) {
     throw conflict("CONTENT_CHANGED", "This work was updated while you were reading. Reload to see the latest version.");
   }
-  const page = await readChunks(workChunks(workId), `${current}_`, opts.after, opts.limit);
+  const page = await readRevisionChunks(workId, current, opts.after, opts.limit);
   return { revisionId: current, ...page };
 }
 
@@ -245,25 +236,27 @@ export async function publishWork(auth: AuthContext, workId: string, log: Logger
   const settings = await settingsService.get();
   const work = await loadOwnWork(workId, auth);
   if (work.status === "published") return getWorkDto(workId, auth); // idempotent
-  if (work.status === "flagged" || ["flagged", "underReview", "rejected"].includes(work.moderationStatus as string)) {
+  if (work.status === "flagged" || ["flagged", "underReview", "rejected"].includes(work.moderationStatus)) {
     throw conflict("WORK_FLAGGED", "This work was flagged by a moderator. Request a review instead of publishing.");
   }
-  await assertPostingAllowed(auth.uid, work.categoryId as string, settings.defaultCategoryPostingAllowed);
+  await assertPostingAllowed(auth.uid, work.categoryId, settings.defaultCategoryPostingAllowed);
 
-  const publishCount = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(workRef(workId));
-    const status = snap.get("status");
-    if (!snap.exists || status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
-    if (status === "flagged") throw conflict("WORK_FLAGGED", "This work was flagged by a moderator.");
-    const count = ((snap.get("publishCount") as number | undefined) ?? 0) + 1;
-    if (status === "published") return null;
-    tx.update(workRef(workId), {
-      status: "published",
-      publishCount: count,
-      publishedAt: snap.get("publishedAt") ?? FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-    applyPublishedDelta(tx, { categoryId: snap.get("categoryId"), authorId: snap.get("authorId") }, 1);
+  const publishCount = await withTransaction(async (c) => {
+    const w = await lockWork(c, workId);
+    if (!w || w.status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    if (w.status === "flagged") throw conflict("WORK_FLAGGED", "This work was flagged by a moderator.");
+    if (w.status === "published") return null;
+    // A prompt entry can only be published while the prompt is still open.
+    if (w.promptId) {
+      await assertCanEnterPrompt(c, { promptId: w.promptId, userId: w.authorId, categoryId: w.categoryId, excludeWorkId: w.id, checkLimit: false });
+    }
+    const count = w.publishCount + 1;
+    await c.query(
+      `UPDATE works SET status = 'published', publish_count = $2,
+              published_at = COALESCE(published_at, inkspire_now()), updated_at = inkspire_now()
+        WHERE id = $1`,
+      [workId, count],
+    );
     return count;
   });
 
@@ -276,18 +269,37 @@ export async function publishWork(auth: AuthContext, workId: string, log: Logger
 /** Takes a published work out of public view without deleting it. */
 export async function archiveWork(auth: AuthContext, workId: string) {
   await loadOwnWork(workId, auth);
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(workRef(workId));
-    if (snap.get("status") !== "published") return;
-    tx.update(workRef(workId), { status: "archived", updatedAt: FieldValue.serverTimestamp() });
-    applyPublishedDelta(tx, { categoryId: snap.get("categoryId"), authorId: snap.get("authorId") }, -1);
-  });
+  await pool.query(
+    `UPDATE works SET status = 'archived', updated_at = inkspire_now() WHERE id = $1 AND status = 'published'`,
+    [workId],
+  );
   return getWorkDto(workId, auth);
 }
 
 export async function setVisibility(auth: AuthContext, workId: string, visibility: "public" | "private") {
   await loadOwnWork(workId, auth);
-  await workRef(workId).update({ visibility, updatedAt: FieldValue.serverTimestamp() });
+  await pool.query(`UPDATE works SET visibility = $2, updated_at = inkspire_now() WHERE id = $1`, [workId, visibility]);
+  return getWorkDto(workId, auth);
+}
+
+export async function setCoverImage(workId: string, url: string) {
+  await pool.query(`UPDATE works SET cover_image_url = $2, updated_at = inkspire_now() WHERE id = $1`, [workId, url]);
+}
+
+/**
+ * Takes a work out of its prompt. Allowed for drafts and entries, but never for a winner: the
+ * database refuses it too (prompt_winners holds a foreign key to the work and its prompt).
+ */
+export async function detachFromPrompt(auth: AuthContext, workId: string) {
+  await loadOwnWork(workId, auth);
+  await withTransaction(async (c) => {
+    const w = await lockWork(c, workId);
+    if (!w || w.status === "deleted") throw notFound("WORK_NOT_FOUND", "That work does not exist.");
+    if (!w.promptId) return;
+    const won = await c.query(`SELECT 1 FROM prompt_winners WHERE work_id = $1`, [workId]);
+    if (won.rowCount) throw conflict("PROMPT_WINNER_LOCKED", "A winning work cannot be removed from its prompt.");
+    await c.query(`UPDATE works SET prompt_id = NULL, updated_at = inkspire_now() WHERE id = $1`, [workId]);
+  });
   return getWorkDto(workId, auth);
 }
 
@@ -300,45 +312,35 @@ export async function softDeleteWork(auth: AuthContext, workId: string, log: Log
     throw notFound("WORK_NOT_FOUND", "That work does not exist.");
   }
 
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(workRef(workId));
-    if (!snap.exists || snap.get("status") === "deleted") return;
-    const t = softDeleteTransition({
-      status: snap.get("status"),
-      moderationStatus: snap.get("moderationStatus"),
-    });
+  await withTransaction(async (c) => {
+    const w = await lockWork(c, workId);
+    if (!w || w.status === "deleted") return;
+    const t = softDeleteTransition({ status: w.status, moderationStatus: w.moderationStatus });
     if (t.noop) return;
-    tx.update(workRef(workId), {
-      status: t.status,
-      moderationStatus: t.moderationStatus,
-      statusBeforeDelete: snap.get("status"),
-      deletedAt: FieldValue.serverTimestamp(),
-      deletedBy: auth.uid,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+    await c.query(
+      `UPDATE works SET status = $2, moderation_status = $3, status_before_delete = $4,
+              deleted_at = inkspire_now(), deleted_by = $5, updated_at = inkspire_now()
+        WHERE id = $1`,
+      [workId, t.status, t.moderationStatus, w.status, auth.uid],
+    );
     if (t.cancelReview) {
       // A deleted work cannot be reviewed, so the open request is closed.
-      const reviewId = snap.get("moderation.reviewId") as string | undefined;
-      if (reviewId) tx.update(reviewsCol().doc(reviewId), { status: "cancelled", resolvedAt: FieldValue.serverTimestamp() });
-    }
-    tx.set(statsRef(), statsIncrement(t.counters), { merge: true });
-    if (t.publishedDelta !== 0) {
-      applyPublishedDelta(tx, { categoryId: snap.get("categoryId"), authorId: snap.get("authorId") }, t.publishedDelta);
+      const reviewId = w.moderation?.reviewId as string | undefined;
+      if (reviewId) {
+        await c.query(
+          `UPDATE work_review_requests SET status = 'cancelled', resolved_at = inkspire_now() WHERE id = $1`,
+          [reviewId],
+        );
+      }
     }
   });
 
   const reason = isAuthor ? "Deleted by author" : "Deleted by moderator";
   await logModeration(
-    { workId, userId: existing.authorId as string, moderatorId: auth.uid, actorRole: auth.profile.role, action: "DELETE", reason },
+    { workId, userId: existing.authorId, moderatorId: auth.uid, actorRole: auth.profile.role, action: "DELETE", reason },
     log,
   );
   if (!isAuthor) {
     await logAdmin({ adminId: auth.uid, action: "WORK_DELETED", targetType: "work", targetId: workId, metadata: { authorId: existing.authorId } }, log);
   }
-}
-
-/** Used by the editor to read the autosaved or original source of a work you authored. */
-export async function assertDraftChunksExist(workId: string) {
-  const first = await draftChunks(workId).limit(1).get();
-  if (first.empty) throw badRequest("DRAFT_NOT_FOUND", "There is no autosaved draft.");
 }

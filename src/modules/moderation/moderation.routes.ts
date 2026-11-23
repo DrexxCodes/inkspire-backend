@@ -2,9 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getAuth, requireUser } from "../../middleware/authenticate.js";
 import { requirePermission } from "../../middleware/authorize.js";
-import { getWork, revisionRef } from "../../repositories/works.repo.js";
-import { readChunks } from "../../services/content.service.js";
-import { revisionChunks } from "../../repositories/works.repo.js";
+import { getRevision, getWork } from "../../repositories/works.repo.js";
+import { readRevisionChunks } from "../../services/content.service.js";
 import { clampLimit } from "../../utils/pagination.js";
 import { ok, okPage } from "../../utils/respond.js";
 import { idParam, parse } from "../../utils/validation.js";
@@ -70,10 +69,10 @@ export async function moderationRoutes(app: FastifyInstance) {
     const reviewId = work?.moderation?.reviewId as string | undefined;
     if (!work || !reviewId) throw notFound("REVIEW_NOT_FOUND", "This work has no pending review.");
     const revisionId = reviewId.slice(id.length + 1);
-    const rev = await revisionRef(id, revisionId).get();
-    if (!rev.exists) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
-    const page = await readChunks(revisionChunks(id, revisionId), "", q.after === undefined ? undefined : Number(q.after), clampLimit(q.limit, 3, 5));
-    return ok({ revision: serialize({ id: rev.id, revisionNumber: rev.get("revisionNumber"), title: rev.get("title") }), ...page });
+    const rev = await getRevision(id, revisionId);
+    if (!rev) throw notFound("REVISION_NOT_FOUND", "That revision does not exist.");
+    const page = await readRevisionChunks(id, revisionId, q.after === undefined ? undefined : Number(q.after), clampLimit(q.limit, 3, 5));
+    return ok({ revision: serialize({ id: rev.id, revisionNumber: rev.revisionNumber, title: rev.title }), ...page });
   });
 
   app.get("/history", { preHandler: moderate }, async (req) => {

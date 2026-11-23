@@ -3,7 +3,7 @@ import { z } from "zod";
 import { requireToken, requireUserAllowInactive, getAuth } from "../../middleware/authenticate.js";
 import { parse } from "../../utils/validation.js";
 import { ok } from "../../utils/respond.js";
-import { toPrivateProfile } from "../../repositories/users.repo.js";
+import { privateProfileOf } from "../../repositories/users.repo.js";
 import { ensureAvatar, isUsernameAvailable, registerProfile, registerSchema } from "./auth.service.js";
 
 export async function authRoutes(app: FastifyInstance) {
@@ -21,7 +21,7 @@ export async function authRoutes(app: FastifyInstance) {
       const body = parse(registerSchema, req.body);
       const profile = await registerProfile(req.token!, body, req.log);
       reply.status(201);
-      return ok({ profile: toPrivateProfile(profile) });
+      return ok({ profile: await privateProfileOf(profile) });
     },
   );
 
@@ -31,7 +31,7 @@ export async function authRoutes(app: FastifyInstance) {
     const auth = getAuth(req);
     const profile = await ensureAvatar(auth.profile, req.log);
     return ok({
-      profile: toPrivateProfile(profile),
+      profile: await privateProfileOf(profile),
       accountStatus: profile.accountStatus,
       permissions: auth.permissions,
     });

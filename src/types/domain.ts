@@ -20,6 +20,7 @@ export interface UserDoc extends Doc {
   role: Role;
   permissions?: Partial<PermissionMap>;
   accountStatus: AccountStatus;
+  /** Legacy Firestore counters. Work totals now come from PostgreSQL, so these are no longer written or read. */
   publishedWorkCount?: number;
   likesReceived?: number;
   /** Verification badge conferred by a super admin. Missing means not verified. */

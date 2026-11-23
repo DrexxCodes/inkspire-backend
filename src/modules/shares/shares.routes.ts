@@ -1,9 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { FieldValue } from "firebase-admin/firestore";
+import { pool } from "../../config/postgres.js";
 import { optionalUser } from "../../middleware/authenticate.js";
 import { requireFeature } from "../../middleware/authorize.js";
-import { workRef } from "../../repositories/works.repo.js";
 import { newEventId, track } from "../../services/analytics.service.js";
 import { TtlSet } from "../../utils/ttl-set.js";
 import { viewerKey } from "../../utils/request.js";
@@ -32,7 +31,7 @@ export async function shareRoutes(app: FastifyInstance) {
 
     const fresh = recent.addIfNew(`${id}:${platform}:${viewerKey(req)}`);
     if (fresh) {
-      await workRef(id).update({ shareCount: FieldValue.increment(1) });
+      await pool.query(`UPDATE works SET share_count = share_count + 1 WHERE id = $1`, [id]);
       track({ eventId: newEventId(`share:${id}`), metric: "shares" }, req.log);
     }
     return ok({ counted: fresh });

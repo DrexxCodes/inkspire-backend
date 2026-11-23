@@ -1,5 +1,6 @@
 import { db } from "../config/firebase.js";
 import type { Doc } from "../types/domain.js";
+import { publishedCountsByCategory } from "./work-stats.repo.js";
 
 export const categoriesCol = () => db.collection("categories");
 
@@ -10,11 +11,18 @@ export const invalidateCategoryCache = () => {
   cache = null;
 };
 
-/** The category list is small and read constantly, so it is cached briefly. */
+/**
+ * The category list is small and read constantly, so it is cached briefly. Published counts come
+ * from PostgreSQL (where the works are) and are cached with it. If PostgreSQL cannot be reached
+ * the categories still load, with counts of zero until the next refresh.
+ */
 export async function listAllCategories(): Promise<Doc[]> {
   if (cache && cache.expiresAt > Date.now()) return cache.items;
-  const snap = await categoriesCol().orderBy("name").limit(200).get();
-  const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as Doc);
+  const [snap, counts] = await Promise.all([
+    categoriesCol().orderBy("name").limit(200).get(),
+    publishedCountsByCategory().catch(() => new Map<string, number>()),
+  ]);
+  const items = snap.docs.map((d) => ({ id: d.id, ...d.data(), publishedCount: counts.get(d.id) ?? 0 }) as Doc);
   cache = { items, expiresAt: Date.now() + CACHE_TTL_MS };
   return items;
 }

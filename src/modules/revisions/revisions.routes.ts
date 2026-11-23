@@ -48,7 +48,7 @@ export async function revisionRoutes(app: FastifyInstance) {
           title: body.title,
           description: body.description,
           categoryId: body.categoryId,
-          coverImageUrl: body.coverImageUrl ?? (work.coverImageUrl as string | null) ?? null,
+          coverImageUrl: body.coverImageUrl ?? work.coverImageUrl,
           content: body.content,
         },
       },

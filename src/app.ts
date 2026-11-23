@@ -17,6 +17,8 @@ import { moderationRoutes } from "./modules/moderation/moderation.routes.js";
 import { analyticsRoutes } from "./modules/analytics/analytics.routes.js";
 import { notificationRoutes } from "./modules/notifications/notifications.routes.js";
 import { adminRoutes } from "./modules/admin/admin.routes.js";
+import { promptRoutes } from "./modules/prompts/prompts.routes.js";
+import { promptAdminRoutes } from "./modules/prompts/prompts.admin.routes.js";
 import { settingsRoutes } from "./modules/settings/settings.routes.js";
 
 declare module "fastify" {
@@ -64,6 +66,8 @@ export async function buildApp(): Promise<FastifyInstance> {
       await v1.register(analyticsRoutes, { prefix: "/analytics" });
       await v1.register(notificationRoutes, { prefix: "/notifications" });
       await v1.register(adminRoutes, { prefix: "/admin" });
+      await v1.register(promptRoutes, { prefix: "/prompts" });
+      await v1.register(promptAdminRoutes, { prefix: "/admin/prompts" });
       await v1.register(settingsRoutes, { prefix: "/settings" });
     },
     { prefix: "/api/v1" },

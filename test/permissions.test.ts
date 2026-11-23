@@ -81,3 +81,19 @@ test("role assignment is capped below the actor's own rank unless super admin", 
   assert.doesNotThrow(() => assertCanAssignRole({ uid: "a", role: "admin" }, "moderator"));
   assert.doesNotThrow(() => assertCanAssignRole({ uid: "a", role: "super_admin" }, "super_admin"));
 });
+
+test("managePrompts belongs to admins and super admins only", () => {
+  assert.equal(resolvePermissions("admin").managePrompts, true);
+  assert.equal(resolvePermissions("super_admin").managePrompts, true);
+  assert.equal(resolvePermissions("user").managePrompts, false);
+  assert.equal(resolvePermissions("moderator").managePrompts, false);
+});
+
+test("a per user override cannot give a moderator or user the managePrompts power", () => {
+  assert.equal(resolvePermissions("moderator", { managePrompts: true }).managePrompts, false);
+  assert.equal(resolvePermissions("user", { managePrompts: true }).managePrompts, false);
+});
+
+test("an admin can have managePrompts switched off by override", () => {
+  assert.equal(resolvePermissions("admin", { managePrompts: false }).managePrompts, false);
+});

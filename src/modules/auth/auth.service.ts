@@ -86,8 +86,6 @@ export async function registerProfile(
     role: isSuperAdmin ? ("super_admin" as const) : ("user" as const),
     accountStatus: "active" as const,
     verified: false,
-    publishedWorkCount: 0,
-    likesReceived: 0,
   };
 
   try {
